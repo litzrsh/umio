@@ -1,6 +1,7 @@
-# Claude is ignored
+# AI is ignored
 .claude
 CLAUDE.md
+AGENTS.md
 # graft's local graph cache — regenerable, not committed (run `graft build`).
 /graft/
 .ignore
