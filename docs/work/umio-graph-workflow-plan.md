@@ -6,6 +6,14 @@
 - Scope: How to implement the design in this repository: contracts, defaults, files, work order, tests, documentation. No code is written until this plan is approved.
 - Target environment: local LLMs on a modest PC, where a single LLM or Agent operation may legitimately run for **two to three hours**. Slow inference must never be mistaken for a crashed executor.
 
+### Progress
+
+| Phase | Status |
+|---|---|
+| P0: Characterization tests | Done (`669c0b4`); `test/workflow-compat.test.ts` |
+| P-T: Provider and transport time limits, `maxConcurrentRequests` | Done; `test/local-providers.test.ts` (classification, defaults, a real HTTP server for header timeouts, retries and aborts, and the limiter). Verified live against local Ollama. |
+| P1–P5 | Not started |
+
 ### Changes in revision 4
 
 - **Local provider defaults are adopted** (formerly open item 1): a 3 h 5 min request timeout, no SDK retries, and `fetch` transport timeouts aligned with the request timeout. They apply only to providers classified as local, a new rule that keeps hosted `openai-compatible` gateways on the cloud defaults (D15).

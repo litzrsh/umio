@@ -2,6 +2,8 @@ import Anthropic from "@anthropic-ai/sdk";
 import type { BetaMessageStreamParams } from "@anthropic-ai/sdk/resources/beta/messages";
 import type { AnthropicProviderConfig } from "../../config/schema.js";
 import { isRetryableStatus, LLMError } from "../../errors.js";
+import { effectiveProviderSettings } from "../local.js";
+import { transportFetchOptions } from "../transport.js";
 import type {
   FinishReason,
   GenerateResult,
@@ -24,15 +26,7 @@ export class AnthropicProvider implements LLMProvider {
   private readonly client: Anthropic;
 
   constructor(config: AnthropicProviderConfig, client?: Anthropic) {
-    // Omitted fields fall through to the SDK's own env/credential resolution.
-    this.client =
-      client ??
-      new Anthropic({
-        ...(config.apiKey !== undefined && { apiKey: config.apiKey }),
-        ...(config.baseURL !== undefined && { baseURL: config.baseURL }),
-        ...(config.timeoutMs !== undefined && { timeout: config.timeoutMs }),
-        ...(config.maxRetries !== undefined && { maxRetries: config.maxRetries }),
-      });
+    this.client = client ?? new Anthropic(anthropicClientOptions(config));
   }
 
   /** Consumes `stream()`: streaming avoids HTTP timeouts on long generations. */
@@ -154,6 +148,25 @@ export function applyCacheBreakpoints(
     }
   }
   return promptCache ? cacheControl(ttl) : undefined;
+}
+
+/**
+ * SDK options for a provider config. Omitted fields fall through to the SDK's
+ * own env/credential resolution. Anthropic is not local unless configured so
+ * (e.g. a local proxy), in which case the local defaults apply.
+ */
+export function anthropicClientOptions(
+  config: AnthropicProviderConfig,
+): ConstructorParameters<typeof Anthropic>[0] {
+  const settings = effectiveProviderSettings(config);
+  const fetchOptions = transportFetchOptions(settings);
+  return {
+    ...(config.apiKey !== undefined && { apiKey: config.apiKey }),
+    ...(config.baseURL !== undefined && { baseURL: config.baseURL }),
+    ...(settings.timeoutMs !== undefined && { timeout: settings.timeoutMs }),
+    ...(settings.maxRetries !== undefined && { maxRetries: settings.maxRetries }),
+    ...(fetchOptions && { fetchOptions: fetchOptions as Record<string, unknown> }),
+  };
 }
 
 export function toAnthropicMessages(messages: Message[]): Anthropic.MessageParam[] {

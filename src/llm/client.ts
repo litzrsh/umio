@@ -2,9 +2,11 @@ import type { KVStore } from "../cache/kv.js";
 import { createKVStore, ResponseCache } from "../cache/response.js";
 import { loadConfig, resolveProviderConfig } from "../config/load.js";
 import type { HarnessConfig, UmioConfig } from "../config/schema.js";
-import { ConfigError } from "../errors.js";
+import { ConfigError, LLMError } from "../errors.js";
 import { builtinMiddleware, type MiddlewareFactory } from "../middleware/registry.js";
 import type { Middleware, MiddlewareContext } from "../middleware/types.js";
+import { RequestLimiter } from "./limiter.js";
+import { effectiveProviderSettings } from "./local.js";
 import { createProvider, type ProviderFactory } from "./providers/index.js";
 import type {
   GenerateRequest,
@@ -33,6 +35,12 @@ export interface LLMOptions {
   middlewareFactories?: Record<string, MiddlewareFactory>;
 }
 
+interface ProviderEntry {
+  provider: LLMProvider;
+  /** Absent when the provider's request concurrency is unlimited. */
+  limiter?: RequestLimiter;
+}
+
 interface ResolvedRequest {
   providerRequest: ProviderRequest;
   context: MiddlewareContext;
@@ -52,7 +60,7 @@ export class LLM implements ModelClient {
   /** Undefined unless the config has `responseCache` or a store was passed in. */
   readonly responseCache: ResponseCache | undefined;
 
-  private readonly providers = new Map<string, LLMProvider>();
+  private readonly providers = new Map<string, ProviderEntry>();
   private readonly env: Record<string, string | undefined>;
   private readonly providerFactory: ProviderFactory;
   private readonly middleware: Middleware[];
@@ -196,9 +204,15 @@ export class LLM implements ModelClient {
     const cached = cacheKey && (await this.responseCache?.get(cacheKey));
     if (cached) return cached;
 
-    const result = await this.provider(resolved.context.providerName).generate(request);
-    if (cacheKey) await this.responseCache?.set(cacheKey, result);
-    return result;
+    const { provider, limiter } = this.provider(resolved.context.providerName);
+    const release = await this.acquireSlot(limiter, resolved, request);
+    try {
+      const result = await provider.generate(request);
+      if (cacheKey) await this.responseCache?.set(cacheKey, result);
+      return result;
+    } finally {
+      release();
+    }
   }
 
   private async *streamProvider(
@@ -212,19 +226,45 @@ export class LLM implements ModelClient {
       return;
     }
 
-    const provider = this.provider(resolved.context.providerName);
-    if (!provider.stream) {
-      const result = await provider.generate(request);
-      if (cacheKey) await this.responseCache?.set(cacheKey, result);
-      yield* replay(result);
-      return;
-    }
-    for await (const event of provider.stream(request)) {
-      if (event.type === "finish" && cacheKey) {
-        await this.responseCache?.set(cacheKey, event.result);
+    const { provider, limiter } = this.provider(resolved.context.providerName);
+    const release = await this.acquireSlot(limiter, resolved, request);
+    // The slot is held until the stream ends, fails, or the consumer stops early
+    // (the generator's `finally` runs on `return()`).
+    try {
+      if (!provider.stream) {
+        const result = await provider.generate(request);
+        if (cacheKey) await this.responseCache?.set(cacheKey, result);
+        release();
+        yield* replay(result);
+        return;
       }
-      yield event;
+      for await (const event of provider.stream(request)) {
+        if (event.type === "finish" && cacheKey) {
+          await this.responseCache?.set(cacheKey, event.result);
+        }
+        yield event;
+      }
+    } finally {
+      release();
     }
+  }
+
+  /** Waits for a request slot. A call aborted while queued is never sent and fails like an SDK abort. */
+  private acquireSlot(
+    limiter: RequestLimiter | undefined,
+    resolved: ResolvedRequest,
+    request: ProviderRequest,
+  ): Promise<() => void> {
+    if (!limiter) return Promise.resolve(() => {});
+    return limiter.acquire(
+      request.signal,
+      () =>
+        new LLMError("Request aborted.", {
+          provider: resolved.context.providerType,
+          retryable: false,
+          cause: request.signal?.reason,
+        }),
+    );
   }
 
   private resolve(request: GenerateRequest): ResolvedRequest {
@@ -279,15 +319,33 @@ export class LLM implements ModelClient {
     });
   }
 
-  private provider(name: string): LLMProvider {
-    let provider = this.providers.get(name);
-    if (!provider) {
+  private provider(name: string): ProviderEntry {
+    let entry = this.providers.get(name);
+    if (!entry) {
       const providerConfig = this.config.providers[name];
       if (!providerConfig) throw new ConfigError(`Unknown provider "${name}".`);
-      provider = this.providerFactory(resolveProviderConfig(name, providerConfig, this.env));
-      this.providers.set(name, provider);
+      const resolved = resolveProviderConfig(name, providerConfig, this.env);
+      const { maxConcurrentRequests } = effectiveProviderSettings(resolved);
+      entry = {
+        provider: this.providerFactory(resolved),
+        ...(Number.isFinite(maxConcurrentRequests) && {
+          limiter: new RequestLimiter(maxConcurrentRequests),
+        }),
+      };
+      this.providers.set(name, entry);
     }
-    return provider;
+    return entry;
+  }
+
+  /** In-flight and queued requests per provider, for monitoring. Providers not yet used are absent. */
+  requestStats(): Record<string, { inFlight: number; waiting: number; max: number }> {
+    const stats: Record<string, { inFlight: number; waiting: number; max: number }> = {};
+    for (const [name, { limiter }] of this.providers) {
+      stats[name] = limiter
+        ? { inFlight: limiter.inFlight, waiting: limiter.waiting, max: limiter.max }
+        : { inFlight: 0, waiting: 0, max: Number.POSITIVE_INFINITY };
+    }
+    return stats;
   }
 }
 

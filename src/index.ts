@@ -28,6 +28,12 @@ export {
 export { ConfigError, LLMError, UmioError } from "./errors.js";
 export { LLM, type LLMOptions } from "./llm/client.js";
 export {
+  type EffectiveProviderSettings,
+  effectiveProviderSettings,
+  isLocalProvider,
+  LOCAL_TIMEOUT_MS,
+} from "./llm/local.js";
+export {
   AnthropicProvider,
   createProvider,
   OLLAMA_DEFAULT_BASE_URL,

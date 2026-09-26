@@ -90,7 +90,42 @@ cp umio.config.example.json umio.config.json
 | `ollama` | Local Ollama | none | `baseURL` defaults to `http://localhost:11434/v1`. |
 | `openai-compatible` | LM Studio, vLLM, llama.cpp, OpenRouter, Groq and others | `baseURL` | `apiKey` is optional; most local servers ignore it. |
 
-All provider types accept `baseURL`, `timeoutMs` and `maxRetries`. Retries use exponential backoff and apply to connection errors, 408, 409, 429 and 5xx responses.
+All provider types accept `baseURL`, `timeoutMs`, `maxRetries`, `local`, `maxConcurrentRequests` and `transport`. Retries use exponential backoff and apply to connection errors (timeouts included), 408, 409, 429 and 5xx responses.
+
+### Local providers
+
+Local models on modest hardware can take hours on a single request. Providers classified as **local** get defaults sized for that. Any value you set explicitly wins.
+
+| Setting | Local default | Otherwise |
+|---|---|---|
+| `timeoutMs`: from sending a request to its response headers | 3 h 5 min (just above the graph node timeout) | SDK default (10 min) |
+| `maxRetries` | `0`: a retry would repeat hours of inference | SDK default (2) |
+| `transport.headersTimeoutMs` / `transport.bodyTimeoutMs`: Node's own `fetch` limits | equal to `timeoutMs` | undici defaults (300 s each) |
+| `maxConcurrentRequests` | `1` | unlimited |
+
+**What counts as local:**
+- `ollama` is always local.
+- `openai-compatible` is local when its `baseURL` host is `localhost` or a loopback or private IP address (checked from the URL alone, with no DNS lookup).
+- `openai` and `anthropic` are not local.
+
+Set `"local": true` or `false` to override the classification. Hosted gateways such as OpenRouter or Groq configured as `openai-compatible` are not local, so they keep their retries.
+
+**Why these defaults:**
+- The SDK timeout only runs until response headers arrive. For a non-streaming request, a local server sends headers only when generation finishes, so the whole generation has to fit inside it.
+- Node's `fetch` has separate 300-second limits for headers and for the gap between body chunks. Without raising them, a long prompt prefill or a long non-streaming call fails after 5 minutes whatever `timeoutMs` says. umio raises them with a dedicated undici dispatcher.
+
+**`maxConcurrentRequests`** caps the requests a provider has in flight at once, per `LLM` instance:
+- **Queueing:** waiting calls are served in order. A waiting call has not been sent yet, so its HTTP timeouts have not started.
+- **Coverage:** every model call counts, including parallel tool calls, agents delegating through `asTool()`, and model calls made by middleware.
+- **Cache:** response-cache hits do not take a slot.
+- **Streaming:** a streaming call keeps its slot until the stream finishes, or until you stop reading it.
+- **Aborts:** a call aborted while waiting is never sent.
+- **Scope:** separate `LLM` instances or processes do not share the limit, and the server's own queue (e.g. `OLLAMA_NUM_PARALLEL`) still applies behind it.
+- **Deadlock risk:** while you are consuming a stream, don't make another call to the same provider when its limit is 1. The second call waits for the stream's slot, and the stream never finishes.
+
+`llm.requestStats()` reports in-flight and waiting requests per provider.
+
+**Behavior change for existing configs:** local providers now default to no retries and one request at a time. To restore the previous behavior, set `maxRetries` and `maxConcurrentRequests` explicitly.
 
 ### Models
 

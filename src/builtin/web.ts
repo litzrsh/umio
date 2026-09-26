@@ -1,8 +1,11 @@
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
 import { z } from "zod";
+import { isInternalAddress } from "../net.js";
 import { type Tool, tool } from "../tools/tool.js";
 import { truncate, withTimeout } from "./shared.js";
+
+export { isInternalAddress };
 
 export interface WebToolsOptions {
   /** Only these domains (and their subdomains) may be fetched. Omit to allow any public host. */
@@ -87,34 +90,6 @@ export function webTools(options: WebToolsOptions = {}): Tool[] {
   });
 
   return [fetchUrl];
-}
-
-/** Loopback, private, link-local, CGNAT, unspecified and multicast ranges (IPv4 and IPv6). */
-export function isInternalAddress(address: string): boolean {
-  const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(address)?.[1];
-  if (mapped) return isInternalAddress(mapped);
-  if (isIP(address) === 4) {
-    const [a = 0, b = 0] = address.split(".").map(Number);
-    return (
-      a === 0 ||
-      a === 10 ||
-      a === 127 ||
-      (a === 100 && b >= 64 && b <= 127) ||
-      (a === 169 && b === 254) ||
-      (a === 172 && b >= 16 && b <= 31) ||
-      (a === 192 && b === 168) ||
-      a >= 224
-    );
-  }
-  const lower = address.toLowerCase();
-  return (
-    lower === "::" ||
-    lower === "::1" ||
-    lower.startsWith("fc") ||
-    lower.startsWith("fd") ||
-    lower.startsWith("fe80") ||
-    lower.startsWith("ff")
-  );
 }
 
 const ENTITIES: Record<string, string> = {

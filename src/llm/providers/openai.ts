@@ -5,6 +5,8 @@ import type {
   OpenAIProviderConfig,
 } from "../../config/schema.js";
 import { isRetryableStatus, LLMError } from "../../errors.js";
+import { effectiveProviderSettings } from "../local.js";
+import { transportFetchOptions } from "../transport.js";
 import type {
   FinishReason,
   GenerateResult,
@@ -31,7 +33,7 @@ export class OpenAIProvider implements LLMProvider {
 
   constructor(config: Config, client?: OpenAI) {
     this.type = config.type;
-    this.client = client ?? new OpenAI(clientOptions(config));
+    this.client = client ?? new OpenAI(openAIClientOptions(config));
   }
 
   async generate(request: ProviderRequest): Promise<GenerateResult> {
@@ -161,10 +163,16 @@ class ChunkAccumulator {
   }
 }
 
-function clientOptions(config: Config): ConstructorParameters<typeof OpenAI>[0] {
+/** SDK options for a provider config, with local defaults applied (see `effectiveProviderSettings`). */
+export function openAIClientOptions(config: Config): ConstructorParameters<typeof OpenAI>[0] {
+  const settings = effectiveProviderSettings(config);
+  const fetchOptions = transportFetchOptions(settings);
   const common = {
-    ...(config.timeoutMs !== undefined && { timeout: config.timeoutMs }),
-    ...(config.maxRetries !== undefined && { maxRetries: config.maxRetries }),
+    ...(settings.timeoutMs !== undefined && { timeout: settings.timeoutMs }),
+    ...(settings.maxRetries !== undefined && { maxRetries: settings.maxRetries }),
+    // undici's Agent satisfies the dispatcher contract of Node's fetch; the SDK's
+    // RequestInit type does not declare `dispatcher`.
+    ...(fetchOptions && { fetchOptions: fetchOptions as Record<string, unknown> }),
   };
   switch (config.type) {
     case "openai":

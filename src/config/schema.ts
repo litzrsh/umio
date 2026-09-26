@@ -1,12 +1,39 @@
 import { z } from "zod";
 
+/**
+ * Settings shared by every provider type. For providers classified as local
+ * (see `src/llm/local.ts`) unset values get local defaults sized for
+ * multi-hour inference: 3 h 5 min timeouts, no retries, one request at a time.
+ */
+const common = {
+  /** Per-request timeout in milliseconds, from sending a request to its response headers. */
+  timeoutMs: z.number().int().positive().optional(),
+  /** Retries on connection errors (timeouts included), 408, 409, 429 and 5xx. SDK default: 2; local default: 0. */
+  maxRetries: z.number().int().min(0).optional(),
+  /**
+   * Whether the server is local. Local providers get long timeouts, no retries and
+   * `maxConcurrentRequests: 1` by default. Inferred when omitted: `ollama` is local;
+   * `openai-compatible` is local when its baseURL host is localhost or a private IP.
+   */
+  local: z.boolean().optional(),
+  /** In-flight request cap for this provider (per LLM instance). Local default: 1; otherwise unlimited. */
+  maxConcurrentRequests: z.number().int().positive().optional(),
+  /** Timeouts inside Node's fetch (undici). Local default: equal to the effective timeoutMs. */
+  transport: z
+    .object({
+      /** Longest wait for response headers. */
+      headersTimeoutMs: z.number().int().positive().optional(),
+      /** Longest gap between response body chunks. */
+      bodyTimeoutMs: z.number().int().positive().optional(),
+    })
+    .strict()
+    .optional(),
+};
+
 const connection = {
   /** Overrides the provider's default endpoint. */
   baseURL: z.string().min(1).optional(),
-  /** Per-request timeout in milliseconds. */
-  timeoutMs: z.number().int().positive().optional(),
-  /** Retries on connection errors, 408, 409, 429 and 5xx. Defaults to the SDK's default (2). */
-  maxRetries: z.number().int().min(0).optional(),
+  ...common,
 };
 
 export const AnthropicProviderSchema = z
@@ -35,8 +62,7 @@ export const OpenAICompatibleProviderSchema = z
     baseURL: z.string().min(1),
     /** Optional: most local servers accept any key. */
     apiKey: z.string().min(1).optional(),
-    timeoutMs: connection.timeoutMs,
-    maxRetries: connection.maxRetries,
+    ...common,
   })
   .strict();
 
