@@ -2,19 +2,33 @@ import type { UmioConfig } from "../config/schema.js";
 import { LLMError, UmioError } from "../errors.js";
 import { MemoryCheckpointStore } from "./checkpoint/memory.js";
 import type { CheckpointStore, Lease } from "./checkpoint/store.js";
-import { CheckpointConflictError, GraphNodeError, LeaseLostError } from "./errors.js";
+import {
+  CheckpointConflictError,
+  DefinitionMismatchError,
+  GraphNodeError,
+  LeaseLostError,
+  LeaseUnavailableError,
+  RecoveryNotApplicableError,
+  RunNotFoundError,
+  RunNotResumableError,
+} from "./errors.js";
 import { definitionHash } from "./identity.js";
 import { checkOutput } from "./output.js";
 import {
   allNodesDone,
+  applyRecovery,
   cancelAttempt,
   completeNode,
   createRun,
   decideEdges,
   failNode,
+  finalizeCancel,
   finishRun,
+  firstFailedNode,
+  orphanedNodes,
   predecessorOutputs,
   readyNodes,
+  recoverOrphans,
   startAttempt,
 } from "./plan.js";
 import { type RuntimeDependencies, withDefaults } from "./runtime.js";
@@ -24,6 +38,8 @@ import type {
   NodeError,
   NodeEvent,
   NodeId,
+  RecoveryAction,
+  RunStatus,
   WorkflowDefinition,
   WorkflowRun,
 } from "./types.js";
@@ -183,6 +199,180 @@ export class WorkflowExecutor {
   }
 
   /**
+   * Continues a run another executor left unfinished, e.g. after a crash. Pass
+   * the same definition (graph ID, version and structure) with fresh handlers.
+   *
+   * - A pending cancel request is honored first: the run ends `cancelled`,
+   *   and attempts the previous owner left running become `uncertain` (W7).
+   * - Otherwise those attempts become `uncertain`, or pending again for nodes
+   *   with `recovery: "retry"` and attempts left (W6). A run with an uncertain
+   *   node resolves as `needs-recovery` without starting anything; resolve
+   *   each such node with `recoverNode()`, then call `resume()` again.
+   * - Otherwise the run is scheduled as by `run()`; completed nodes never re-run.
+   *
+   * Rejects with `RunNotFoundError`, `RunNotResumableError` (terminal),
+   * `DefinitionMismatchError` or `LeaseUnavailableError` (still owned; a
+   * crashed owner's lease expires within `leaseTtlMs`).
+   */
+  async resume(
+    definition: WorkflowDefinition,
+    runId: string,
+    options: Omit<GraphRunOptions, "runId"> = {},
+  ): Promise<WorkflowRun> {
+    validateDefinition(definition);
+    const maxConcurrency = positiveInt(
+      options.maxConcurrency ?? this.maxConcurrency,
+      "maxConcurrency",
+    );
+    let { record, lease } = await this.takeOver(definition, runId, ["running", "needs-recovery"]);
+
+    if (await this.store.isCancelRequested(runId)) {
+      record = await this.write(record, finalizeCancel(record, this.deps.now()), lease); // W7
+      await this.release(lease);
+      return record;
+    }
+    if (orphanedNodes(record).length > 0) {
+      record = await this.write(
+        record,
+        recoverOrphans(definition.graph, record, this.deps.now()),
+        lease,
+      ); // W6
+    }
+    if (record.status === "needs-recovery") {
+      await this.release(lease);
+      return record;
+    }
+    return this.drive(definition, record, lease, maxConcurrency);
+  }
+
+  /**
+   * Resolves an `uncertain` node of a `needs-recovery` run, after you have
+   * checked what its interrupted attempt actually did (its side effects are
+   * keyed by `idempotencyKey`). It never starts attempts: call `resume()`
+   * afterwards to continue the run.
+   *
+   * - `retry`: the node runs again on resume, even beyond its retry budget.
+   * - `complete`: the node completes with `output` (checked like a handler's)
+   *   and its edges are decided, as if its attempt had succeeded.
+   * - `fail`: the node and the run fail.
+   *
+   * A pending cancel request wins: the run is cancelled instead (W7).
+   */
+  async recoverNode(
+    definition: WorkflowDefinition,
+    runId: string,
+    nodeId: NodeId,
+    action: RecoveryAction,
+  ): Promise<WorkflowRun> {
+    validateDefinition(definition);
+    let { record, lease } = await this.takeOver(definition, runId, ["needs-recovery"]);
+    try {
+      if (await this.store.isCancelRequested(runId)) {
+        record = await this.write(record, finalizeCancel(record, this.deps.now()), lease); // W7
+        await this.release(lease);
+        return record;
+      }
+      const decisions = this.recoveryDecisions(definition, record, nodeId, action);
+      record = await this.write(
+        record,
+        applyRecovery(definition.graph, record, nodeId, action, decisions, this.deps.now()),
+        lease,
+      ); // W8
+    } catch (error) {
+      // An invalid action writes nothing; the lease can go back at once.
+      if (error instanceof RecoveryNotApplicableError) await this.release(lease);
+      throw error;
+    }
+    await this.release(lease);
+    return record;
+  }
+
+  /** Checks a recovery action against the run and, for `complete`, decides the node's edges. */
+  private recoveryDecisions(
+    definition: WorkflowDefinition,
+    record: WorkflowRun,
+    nodeId: NodeId,
+    action: RecoveryAction,
+  ): Record<string, boolean> {
+    const { runId } = record;
+    const node = record.nodes[nodeId];
+    if (node?.status !== "uncertain") {
+      throw new RecoveryNotApplicableError(
+        runId,
+        nodeId,
+        node
+          ? `Node "${nodeId}" of run "${runId}" is ${node.status}, not uncertain.`
+          : `Run "${runId}" has no node "${nodeId}".`,
+      );
+    }
+    if (action.type !== "complete") return {};
+    const spec = definition.graph.nodes.find((item) => item.id === nodeId);
+    const invalid = checkOutput(action.output, {
+      maxOutputBytes: spec?.maxOutputBytes ?? this.maxOutputBytes,
+      nodeId,
+      idempotencyKey: `${runId}:${nodeId}`,
+    });
+    if (invalid) throw new RecoveryNotApplicableError(runId, nodeId, invalid.message);
+    const decided = decideEdges(definition, record, nodeId, action.output);
+    if (!decided.ok) throw new RecoveryNotApplicableError(runId, nodeId, decided.error.message);
+    return decided.decisions;
+  }
+
+  /**
+   * Resume steps 1–4 (plan §5): load and check the run and its definition,
+   * acquire the lease, and reload under it.
+   */
+  private async takeOver(
+    definition: WorkflowDefinition,
+    runId: string,
+    statuses: readonly RunStatus[],
+  ): Promise<{ record: WorkflowRun; lease: Lease }> {
+    const check = (record: WorkflowRun | undefined): WorkflowRun => {
+      if (!record) throw new RunNotFoundError(runId);
+      checkIdentity(definition, record);
+      if (!statuses.includes(record.status)) {
+        throw new RunNotResumableError(
+          runId,
+          record.status,
+          statuses.includes("running")
+            ? undefined
+            : `Run "${runId}" is ${record.status}; recoverNode needs a needs-recovery run (call resume() first).`,
+        );
+      }
+      return record;
+    };
+    check(await this.store.load(runId));
+    const lease = await this.store.acquireLease(runId, this.ownerId, this.leaseTtlMs);
+    if (!lease) throw new LeaseUnavailableError(runId, this.leaseTtlMs);
+    try {
+      return { record: check(await this.store.load(runId)), lease };
+    } catch (error) {
+      await this.release(lease);
+      throw error;
+    }
+  }
+
+  /** A fenced compare-and-swap of `next` over `current`; returns `next` once written. */
+  private async write(current: WorkflowRun, next: WorkflowRun, lease: Lease): Promise<WorkflowRun> {
+    const result = await this.store.compareAndSwap(next, current.revision, lease);
+    if (result === "ok") return next;
+    throw result === "lease-lost"
+      ? new LeaseLostError(current.runId)
+      : new CheckpointConflictError(
+          current.runId,
+          `Run "${current.runId}" changed under a valid lease (expected revision ${current.revision}).`,
+        );
+  }
+
+  private async release(lease: Lease): Promise<void> {
+    try {
+      await this.store.releaseLease(lease);
+    } catch {
+      // What had to be written is written; an unreleased lease just expires.
+    }
+  }
+
+  /**
    * Owns a run until it is terminal: schedules nodes, applies their results and
    * keeps the lease. Resolves with the terminal record. Rejects with
    * `LeaseLostError` or `CheckpointConflictError` (or a store error) after
@@ -203,21 +393,14 @@ export class WorkflowExecutor {
     let fatal: Error | undefined;
     let cancelRequested = false;
     let wake = deferred();
-    let halt: Halt | undefined;
+    // A resumed run may already have a failed node (a crash before W5): finish it as failed.
+    const failed = firstFailedNode(graph, initial);
+    // (Asserted: closures assign it, which control-flow narrowing cannot see.)
+    let halt = (failed ? { kind: "failed", ...failed } : undefined) as Halt | undefined;
 
     const commit = async (next: WorkflowRun) => {
       if (fatal) throw fatal;
-      const result = await this.store.compareAndSwap(next, record.revision, lease);
-      if (result === "ok") {
-        record = next;
-        return;
-      }
-      throw result === "lease-lost"
-        ? new LeaseLostError(runId)
-        : new CheckpointConflictError(
-            runId,
-            `Run "${runId}" changed under a valid lease (expected revision ${record.revision}).`,
-          );
+      record = await this.write(record, next, lease);
     };
     const loseLease = () => {
       fatal ??= new LeaseLostError(runId);
@@ -304,11 +487,7 @@ export class WorkflowExecutor {
             throw new UmioError(`Run ${runId} stalled with unfinished nodes.`); // scheduler bug
           }
           stopAllTimers();
-          try {
-            await this.store.releaseLease(lease);
-          } catch {
-            // The terminal status is written; an unreleased lease just expires.
-          }
+          await this.release(lease);
           return record;
         }
 
@@ -453,6 +632,19 @@ function deferred(): { promise: Promise<void>; resolve(): void } {
     resolve = done;
   });
   return { promise, resolve };
+}
+
+function checkIdentity(definition: WorkflowDefinition, run: WorkflowRun): void {
+  const actual = {
+    workflowId: definition.graph.id,
+    definitionVersion: definition.graph.version,
+    definitionHash: definitionHash(definition),
+  };
+  for (const field of ["workflowId", "definitionVersion", "definitionHash"] as const) {
+    if (run[field] !== actual[field]) {
+      throw new DefinitionMismatchError(run.runId, field, run[field], actual[field]);
+    }
+  }
 }
 
 function positiveInt(value: number, name: string): number {

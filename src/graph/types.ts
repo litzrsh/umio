@@ -106,6 +106,15 @@ export type NodeEvent =
   | { type: "adr-proposed"; agent: string; adr: Adr }
   | { type: "custom"; name: string; data?: JsonValue };
 
+/** What `recoverNode()` does with an uncertain node. */
+export type RecoveryAction =
+  /** Run the node again (after `resume()`), even beyond its retry budget. Reuses the idempotency key. */
+  | { type: "retry" }
+  /** Record the node as completed with this output, e.g. after checking its side effect happened. */
+  | { type: "complete"; output: JsonValue }
+  /** Record the node, and so the run, as failed. */
+  | { type: "fail"; message?: string };
+
 export interface NodeError {
   readonly code: string;
   readonly message: string;

@@ -1,11 +1,12 @@
 // Public graph-workflow surface. Retries, timeouts, the full cancel flow and
-// resumption arrive in later phases (docs/work/umio-graph-workflow-plan.md).
+// observers arrive in P5 (docs/work/umio-graph-workflow-plan.md).
 export {
   type AgentNodeOptions,
   type AgentNodeOutput,
   agentNode,
   defaultTask,
 } from "./agent-node.js";
+export { FileCheckpointStore, type FileCheckpointStoreOptions } from "./checkpoint/file.js";
 export {
   MemoryCheckpointStore,
   type MemoryCheckpointStoreOptions,
@@ -20,10 +21,15 @@ export {
 export {
   CheckpointConflictError,
   CheckpointSchemaError,
+  CheckpointStoreLockedError,
+  DefinitionMismatchError,
   GraphNodeError,
   GraphValidationError,
   LeaseLostError,
+  LeaseUnavailableError,
+  RecoveryNotApplicableError,
   RunNotFoundError,
+  RunNotResumableError,
 } from "./errors.js";
 export {
   DEFAULT_CANCEL_POLL_INTERVAL_MS,
@@ -49,6 +55,7 @@ export type {
   NodeRun,
   NodeSpec,
   NodeStatus,
+  RecoveryAction,
   RetryPolicy,
   RunStatus,
   WorkflowDefinition,

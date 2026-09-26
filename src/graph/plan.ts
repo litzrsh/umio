@@ -14,6 +14,7 @@ import type {
   NodeId,
   NodeRun,
   NodeSpec,
+  RecoveryAction,
   WorkflowDefinition,
   WorkflowGraph,
   WorkflowRun,
@@ -196,6 +197,125 @@ export function finishRun(
   return bump({ ...run, status, ...(error && { error }) }, now);
 }
 
+/** Nodes recorded as `running`: when a run is taken over, their previous owner is gone. */
+export function orphanedNodes(run: WorkflowRun): NodeId[] {
+  return Object.values(run.nodes)
+    .filter((node) => node.status === "running")
+    .map((node) => node.nodeId);
+}
+
+/**
+ * W6, the first write under a new lease: every orphaned attempt's outcome is
+ * unknown. A node with `recovery: "retry"` and attempts left becomes pending
+ * again; any other becomes `uncertain` (`process-lost`). If any node is
+ * uncertain, the run parks as `needs-recovery` in the same write.
+ */
+export function recoverOrphans(graph: WorkflowGraph, run: WorkflowRun, now: number): WorkflowRun {
+  let next = run;
+  for (const nodeId of orphanedNodes(run)) {
+    const node = requireNode(next, nodeId);
+    const spec = requireSpec(graph, nodeId);
+    const maxAttempts = spec.retry?.maxAttempts ?? 1;
+    next = withNode(
+      next,
+      spec.recovery === "retry" && node.attempt < maxAttempts
+        ? pendingAgain(node, now)
+        : { ...node, status: "uncertain", uncertainReason: "process-lost", finishedAt: now },
+    );
+  }
+  return bump(parkIfUncertain(next), now);
+}
+
+/**
+ * W7: a cancel request found by a new owner. Orphaned attempts become
+ * `uncertain` (their effects may have happened) and the run is cancelled.
+ * Nodes that were already uncertain stay so.
+ */
+export function finalizeCancel(run: WorkflowRun, now: number): WorkflowRun {
+  let next = run;
+  for (const nodeId of orphanedNodes(run)) {
+    const node = requireNode(next, nodeId);
+    next = withNode(next, {
+      ...node,
+      status: "uncertain",
+      uncertainReason: "process-lost",
+      finishedAt: now,
+    });
+  }
+  return bump({ ...next, status: "cancelled" }, now);
+}
+
+/**
+ * W8: applies a recovery action to an uncertain node and records it. For
+ * `complete`, the caller has checked the output and decided the edges, as for
+ * W2. The run returns to `running` once no node is uncertain, unless it failed.
+ */
+export function applyRecovery(
+  graph: WorkflowGraph,
+  run: WorkflowRun,
+  nodeId: NodeId,
+  action: RecoveryAction,
+  decisions: Record<string, boolean>,
+  now: number,
+): WorkflowRun {
+  const node = requireNode(run, nodeId);
+  const recoveries = [...(node.recoveries ?? []), { action: action.type, at: now }];
+  let next: WorkflowRun;
+  switch (action.type) {
+    case "retry":
+      next = withNode(run, { ...pendingAgain(node, now), recoveries });
+      break;
+    case "complete": {
+      const { uncertainReason: _, ...rest } = node;
+      // completeNode records the W2 contents and bumps the revision itself.
+      next = completeNode(
+        graph,
+        withNode(run, { ...rest, recoveries }),
+        nodeId,
+        action.output,
+        decisions,
+        now,
+      );
+      break;
+    }
+    case "fail": {
+      const error: NodeError = {
+        code: "recovery-failed",
+        message: (action.message ?? "Marked as failed by recoverNode.").slice(0, 1_000),
+        retryable: false,
+      };
+      const { uncertainReason: _, ...rest } = node;
+      next = withNode(run, { ...rest, status: "failed", error, recoveries, finishedAt: now });
+      next = {
+        ...next,
+        status: "failed",
+        error: { code: error.code, message: error.message, nodeId },
+      };
+      break;
+    }
+  }
+  if (next.status === "needs-recovery" && !hasUncertain(next))
+    next = { ...next, status: "running" };
+  return action.type === "complete" ? next : bump(next, now);
+}
+
+/** The first failed node in declaration order, if any. */
+export function firstFailedNode(
+  graph: WorkflowGraph,
+  run: WorkflowRun,
+): { nodeId: NodeId; error: NodeError } | undefined {
+  for (const spec of graph.nodes) {
+    const node = run.nodes[spec.id];
+    if (node?.status === "failed") {
+      return {
+        nodeId: spec.id,
+        error: node.error ?? { code: "failed", message: "Node failed.", retryable: false },
+      };
+    }
+  }
+  return undefined;
+}
+
 /** True when every node is completed or skipped. */
 export function allNodesDone(run: WorkflowRun): boolean {
   return Object.values(run.nodes).every(
@@ -225,6 +345,28 @@ function propagateSkips(graph: WorkflowGraph, run: WorkflowRun, now: number): Wo
     }
   }
   return next;
+}
+
+/** A node made ready to start again; its attempt count and recoveries are kept. */
+function pendingAgain(node: NodeRun, now: number): NodeRun {
+  return {
+    nodeId: node.nodeId,
+    status: "pending",
+    attempt: node.attempt,
+    retryAt: now,
+    ...(node.selectedPredecessor !== undefined && {
+      selectedPredecessor: node.selectedPredecessor,
+    }),
+    ...(node.recoveries && { recoveries: node.recoveries }),
+  };
+}
+
+function hasUncertain(run: WorkflowRun): boolean {
+  return Object.values(run.nodes).some((node) => node.status === "uncertain");
+}
+
+function parkIfUncertain(run: WorkflowRun): WorkflowRun {
+  return hasUncertain(run) ? { ...run, status: "needs-recovery" } : run;
 }
 
 function predicateError(edge: EdgeSpec, reason: unknown): NodeError {

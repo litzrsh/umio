@@ -4,8 +4,6 @@
 
 `umio` lets you assemble AI agents, give them tools, and coordinate them through type-safe workflows. It runs on cloud LLMs (Anthropic, OpenAI and other hosted APIs) and on local LLMs (Ollama, LM Studio, vLLM, llama.cpp) behind a single interface configured in JSON.
 
-> **Status:** early development, not published to npm. Phases 1-3 are complete: the core engine (LLM layer, tools, streaming, caching, middleware), agents with sequential and hierarchical workflows, and built-in tools. Graph workflows remain (see [Roadmap](#roadmap)).
-
 ---
 
 ## Features
@@ -389,7 +387,7 @@ Files are read as `NNNN-*.md`. The status comes from a `## Status` section or a 
 
 ### Graph workflows (in progress)
 
-`WorkflowExecutor` runs a directed acyclic graph of nodes: branches, parallel paths and joins. It is being built in phases (see `docs/work/umio-graph-workflow-plan.md`). Every change to a run is checkpointed to a `CheckpointStore`; **resuming an interrupted run, retries, timeouts and the full cancel flow come in later phases.**
+`WorkflowExecutor` runs a directed acyclic graph of nodes: branches, parallel paths and joins. It is being built in phases (see `docs/work/umio-graph-workflow-plan.md`). Every change to a run is checkpointed to a `CheckpointStore`, and an interrupted run can be resumed by another process. **Retries, timeouts, the full cancel flow and observers come in a later phase.**
 
 ```typescript
 import { agentNode, WorkflowExecutor, type WorkflowDefinition } from "umio";
@@ -459,6 +457,30 @@ run.nodes.merge?.output;  // { text, usage } from agentNode
 - If the lease is lost, the executor aborts running nodes, writes nothing more and rejects with `LeaseLostError`. A write that conflicts under a valid lease rejects with `CheckpointConflictError`.
 - `store.requestCancel(runId)` asks the owner to stop. It notices within 2 s (`cancelPollIntervalMs`), aborts running nodes, starts nothing new and ends the run `cancelled`. A handler that ignores its signal is still waited for, for now.
 - Custom stores implement `CheckpointStore` and should pass the contract suite in `test/checkpoint-contract.ts`. umio never claims exactly-once execution: use `idempotencyKey` to deduplicate side effects.
+- `FileCheckpointStore.open({ dir })` keeps runs on disk so they survive a restart. It is **experimental and single-process only**: never share its directory between processes. It refuses to open a directory another live process is using.
+
+**Resuming after a crash**
+- `executor.resume(definition, runId)` continues a run whose process died. Pass the same definition (graph ID, `version`, structure) with fresh handlers; a mismatch rejects with `DefinitionMismatchError`.
+- The dead process's lease must expire first (up to 30 s after its last renewal); until then `resume()` rejects with `LeaseUnavailableError`.
+- Completed nodes never run again. A node that was running when the process died has an unknown outcome: its side effects may or may not have happened. It becomes **`uncertain`**, and the run parks as **`needs-recovery`** without starting anything.
+- Decide what happened (look up the effect by `idempotencyKey`), then call `executor.recoverNode(definition, runId, nodeId, action)` and `resume()` again:
+  - `{ type: "retry" }` runs the node again, with the same idempotency key;
+  - `{ type: "complete", output }` records it as completed with that output;
+  - `{ type: "fail", message? }` fails the node and the run.
+- Nodes with idempotent handlers can opt in to automatic recovery with `recovery: "retry"` and `retry: { maxAttempts: 2, … }` or more: they are retried on resume while attempts remain.
+- A pending cancel request wins: `resume()` and `recoverNode()` then end the run `cancelled`.
+
+```typescript
+const store = await FileCheckpointStore.open({ dir: ".umio/runs" });
+const executor = WorkflowExecutor.fromConfig(llm.config, { store });
+let run = await executor.resume(definition, runId);
+if (run.status === "needs-recovery") {
+  for (const node of Object.values(run.nodes).filter((n) => n.status === "uncertain")) {
+    await executor.recoverNode(definition, runId, node.nodeId, { type: "retry" });
+  }
+  run = await executor.resume(definition, runId);
+}
+```
 
 The sequential `Workflow` above runs on the same executor internally, with unchanged behavior.
 

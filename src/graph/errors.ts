@@ -64,3 +64,67 @@ export class LeaseLostError extends UmioError {
     super(`Lost the lease on run "${runId}"; stopped without further writes.`);
   }
 }
+
+/** The run cannot be resumed or recovered in its current status (e.g. it is terminal). */
+export class RunNotResumableError extends UmioError {
+  constructor(
+    readonly runId: string,
+    readonly status: string,
+    reason?: string,
+  ) {
+    super(reason ?? `Run "${runId}" is ${status} and cannot be resumed.`);
+  }
+}
+
+/**
+ * The definition given to `resume()` or `recoverNode()` is not the one the run
+ * was started with: its graph ID, version or structure hash differs.
+ */
+export class DefinitionMismatchError extends UmioError {
+  constructor(
+    readonly runId: string,
+    readonly field: "workflowId" | "definitionVersion" | "definitionHash",
+    readonly expected: string,
+    readonly actual: string,
+  ) {
+    super(
+      `Run "${runId}" was started with ${field} "${expected}", but the definition has "${actual}".`,
+    );
+  }
+}
+
+/**
+ * Another owner holds the run's lease. If that owner crashed, its lease
+ * expires at most `leaseTtlMs` after its last renewal; try again then.
+ */
+export class LeaseUnavailableError extends UmioError {
+  constructor(
+    readonly runId: string,
+    readonly leaseTtlMs: number,
+  ) {
+    super(
+      `Run "${runId}" is owned by another executor. If it crashed, its lease expires within ${leaseTtlMs} ms.`,
+    );
+  }
+}
+
+/** A `recoverNode()` action cannot be applied: the node is not uncertain, or the given output is invalid. */
+export class RecoveryNotApplicableError extends UmioError {
+  constructor(
+    readonly runId: string,
+    readonly nodeId: string,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
+/** Another `FileCheckpointStore` instance, in this or another live process, uses the directory. */
+export class CheckpointStoreLockedError extends UmioError {
+  constructor(
+    readonly dir: string,
+    readonly pid: number,
+  ) {
+    super(`Checkpoint directory ${dir} is in use by process ${pid}.`);
+  }
+}
