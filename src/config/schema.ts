@@ -121,6 +121,19 @@ export const AdrConfigSchema = z
   })
   .strict();
 
+/**
+ * Settings for `WorkflowExecutor.fromConfig`. Explicit constructor and run
+ * options take precedence. Fields are added as the executor implements them.
+ */
+export const GraphConfigSchema = z
+  .object({
+    /** Nodes running at once. Default 4; 1 is recommended for a single local model. */
+    maxConcurrency: z.number().int().positive().optional(),
+    /** Largest checkpointed node output in bytes. Default 262144 (256 KiB). */
+    maxOutputBytes: z.number().int().positive().optional(),
+  })
+  .strict();
+
 export const ModelConfigSchema = z
   .object({
     /** Key of an entry in `providers`. */
@@ -186,6 +199,8 @@ export const UmioConfigSchema = z
     harnesses: z.record(z.string(), HarnessSchema).optional(),
     /** Architecture Decision Records applied to workflows. */
     adr: AdrConfigSchema.optional(),
+    /** Graph workflow executor settings, applied by `WorkflowExecutor.fromConfig`. */
+    graph: GraphConfigSchema.optional(),
     /**
      * Named toolsets built from built-in (or registered) tool groups, e.g.
      * { "project-files": { "use": "files", "root": ".", "readOnly": true } }.
@@ -234,6 +249,7 @@ export type ResponseCacheConfig = z.infer<typeof ResponseCacheConfigSchema>;
 export type HarnessConfig = z.infer<typeof HarnessSchema>;
 export type MiddlewareSpec = z.infer<typeof MiddlewareSpecSchema>;
 export type AdrConfig = z.infer<typeof AdrConfigSchema>;
+export type GraphConfig = z.infer<typeof GraphConfigSchema>;
 export type UmioConfig = z.infer<typeof UmioConfigSchema> & {
   /** Directory of the config file; set by `loadConfig`. Relative tool paths resolve against it. */
   configDir?: string;

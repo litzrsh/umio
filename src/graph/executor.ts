@@ -1,10 +1,14 @@
+import type { UmioConfig } from "../config/schema.js";
 import { LLMError, UmioError } from "../errors.js";
-import { GraphNodeError, GraphUnsupportedError } from "./errors.js";
+import { GraphNodeError } from "./errors.js";
 import { definitionHash } from "./identity.js";
+import { checkOutput } from "./output.js";
 import {
   allNodesDone,
+  cancelAttempt,
   completeNode,
   createRun,
+  decideEdges,
   failNode,
   finishRun,
   predecessorOutputs,
@@ -23,12 +27,18 @@ import type {
 } from "./types.js";
 import { isJsonValue, validateDefinition } from "./validate.js";
 
+export const DEFAULT_MAX_CONCURRENCY = 4;
 export const DEFAULT_MAX_OUTPUT_BYTES = 262_144;
 const MAX_ERROR_MESSAGE = 1_000;
 
 export interface WorkflowExecutorOptions {
-  /** P1 runs one node at a time; values above 1 arrive with DAG execution (P2). */
+  /**
+   * Nodes running at once. Default 4; 1 is recommended for a single local model.
+   * Note that it does not limit model calls made inside one node (parallel tool
+   * calls); the provider's `maxConcurrentRequests` does.
+   */
   maxConcurrency?: number;
+  /** Largest checkpointed node output, in UTF-8 bytes of JSON. Default 256 KiB. */
   maxOutputBytes?: number;
   /** Receives node events (`context.emit`). Errors thrown by it are ignored. */
   onNodeEvent?(nodeId: NodeId, attempt: number, event: NodeEvent): void;
@@ -36,20 +46,32 @@ export interface WorkflowExecutorOptions {
 
 export interface GraphRunOptions {
   readonly runId?: string;
+  /** Overrides the executor's `maxConcurrency` for this run. */
+  readonly maxConcurrency?: number;
+}
+
+type Outcome = { ok: true; output: JsonValue } | { ok: false; error: NodeError };
+
+interface RunningAttempt {
+  attempt: number;
+  controller: AbortController;
+  settled: Promise<{ nodeId: NodeId; attempt: number; outcome: Outcome }>;
 }
 
 /**
- * Runs workflow definitions. Phase P1 of docs/work/umio-graph-workflow-plan.md:
- * validation, definition identity, and sequential execution of graphs with
- * unconditional edges and `join: "all"`, kept in memory. Checkpoint stores,
- * branching, concurrency, retries, timeouts, cancellation and resumption are
- * added in later phases; until then the executor stays internal.
+ * Runs workflow definitions: validation, definition identity, branching
+ * (predicates), joins, skip propagation and bounded concurrency, with the run
+ * record kept in memory. Checkpoint stores, retries, timeouts, cancellation and
+ * resumption arrive in later phases (docs/work/umio-graph-workflow-plan.md).
  *
  * Every change to the run record goes through `commit()`, the single point
- * where later phases write through a fenced checkpoint store.
+ * where later phases write through a fenced checkpoint store. Results are
+ * applied one at a time by the scheduling loop, never from inside handler
+ * callbacks, so record changes are serialized even with concurrent nodes.
  */
 export class WorkflowExecutor {
   private readonly deps: RuntimeDependencies;
+  private readonly maxConcurrency: number;
   private readonly maxOutputBytes: number;
 
   constructor(
@@ -57,16 +79,40 @@ export class WorkflowExecutor {
     dependencies?: Partial<RuntimeDependencies>,
   ) {
     this.deps = withDefaults(dependencies);
-    this.maxOutputBytes = options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
-    if ((options.maxConcurrency ?? 1) !== 1) {
-      throw new GraphUnsupportedError("maxConcurrency above 1 is not supported yet.");
-    }
+    this.maxConcurrency = positiveInt(
+      options.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY,
+      "maxConcurrency",
+    );
+    this.maxOutputBytes = positiveInt(
+      options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES,
+      "maxOutputBytes",
+    );
+  }
+
+  /**
+   * Creates an executor from the config's `graph` section. Precedence, highest
+   * first: `GraphRunOptions` → `options` here → the config file → built-in defaults.
+   */
+  static fromConfig(
+    config: Pick<UmioConfig, "graph">,
+    options: WorkflowExecutorOptions = {},
+    dependencies?: Partial<RuntimeDependencies>,
+  ): WorkflowExecutor {
+    const fromFile = config.graph ?? {};
+    return new WorkflowExecutor(
+      {
+        ...(fromFile.maxConcurrency !== undefined && { maxConcurrency: fromFile.maxConcurrency }),
+        ...(fromFile.maxOutputBytes !== undefined && { maxOutputBytes: fromFile.maxOutputBytes }),
+        ...definedOnly(options),
+      },
+      dependencies,
+    );
   }
 
   /**
    * Runs a definition to a terminal status. Resolves with the run record whether
    * the run completed or failed (a node failure is data, not an exception);
-   * rejects only for invalid definitions or input.
+   * rejects only for invalid definitions, input or options.
    */
   async run(
     definition: WorkflowDefinition,
@@ -74,8 +120,11 @@ export class WorkflowExecutor {
     options: GraphRunOptions = {},
   ): Promise<WorkflowRun> {
     validateDefinition(definition);
-    assertSupported(definition);
     if (!isJsonValue(input)) throw new UmioError("Run input must be a JSON value.");
+    const maxConcurrency = positiveInt(
+      options.maxConcurrency ?? this.maxConcurrency,
+      "maxConcurrency",
+    );
 
     const { graph } = definition;
     let record = createRun({
@@ -89,35 +138,75 @@ export class WorkflowExecutor {
       record = next;
     };
 
+    const running = new Map<NodeId, RunningAttempt>();
+    let failure: { nodeId: NodeId; error: NodeError } | undefined;
+    const startFailing = (nodeId: NodeId, error: NodeError) => {
+      failure = { nodeId, error };
+      // Stop the rest of the run: running attempts are asked to stop; results
+      // that still arrive are recorded, but nothing new starts.
+      for (const attempt of running.values()) attempt.controller.abort(failureReason(nodeId));
+    };
+
     for (;;) {
-      const [nodeId] = readyNodes(graph, record, this.deps.now());
-      if (nodeId === undefined) {
-        // With unconditional edges and no retries, nothing ready means every node
-        // completed (a failure returns below). Anything else is a scheduler bug.
-        if (!allNodesDone(record)) {
-          throw new UmioError(`Run ${record.runId} stalled with unfinished nodes.`);
+      if (!failure) {
+        for (const nodeId of readyNodes(graph, record, this.deps.now())) {
+          if (running.size >= maxConcurrency) break;
+          commit(startAttempt(record, nodeId, this.deps.now()));
+          const attempt = record.nodes[nodeId]?.attempt ?? 1;
+          const controller = new AbortController();
+          running.set(nodeId, {
+            attempt,
+            controller,
+            settled: this.invoke(definition, record, nodeId, attempt, controller.signal).then(
+              (outcome) => ({ nodeId, attempt, outcome }),
+            ),
+          });
         }
-        commit(finishRun(record, "completed", this.deps.now()));
-        return record;
       }
 
-      commit(startAttempt(record, nodeId, this.deps.now()));
-      const attempt = record.nodes[nodeId]?.attempt ?? 1;
-      const outcome = await this.invoke(definition, record, nodeId, attempt);
+      if (running.size === 0) {
+        if (failure) {
+          commit(
+            finishRun(record, "failed", this.deps.now(), {
+              code: failure.error.code,
+              message: failure.error.message,
+              nodeId: failure.nodeId,
+            }),
+          );
+          return record;
+        }
+        if (allNodesDone(record)) {
+          commit(finishRun(record, "completed", this.deps.now()));
+          return record;
+        }
+        throw new UmioError(`Run ${record.runId} stalled with unfinished nodes.`); // scheduler bug
+      }
+
+      const { nodeId, attempt, outcome } = await Promise.race(
+        [...running.values()].map((entry) => entry.settled),
+      );
+      running.delete(nodeId);
+      // Apply a result only while its attempt is current (I7).
+      const state = record.nodes[nodeId];
+      if (state?.status !== "running" || state.attempt !== attempt) continue;
 
       if (outcome.ok) {
-        commit(completeNode(graph, record, nodeId, outcome.output, this.deps.now()));
-        continue;
+        const decided = decideEdges(definition, record, nodeId, outcome.output);
+        if (decided.ok) {
+          commit(
+            completeNode(graph, record, nodeId, outcome.output, decided.decisions, this.deps.now()),
+          );
+        } else {
+          commit(failNode(record, nodeId, decided.error, this.deps.now()));
+          if (!failure) startFailing(nodeId, decided.error);
+        }
+      } else if (failure) {
+        // Stopped because the run was already failing.
+        commit(cancelAttempt(record, nodeId, this.deps.now()));
+      } else {
+        commit(failNode(record, nodeId, outcome.error, this.deps.now()));
+        startFailing(nodeId, outcome.error);
       }
-      commit(failNode(record, nodeId, outcome.error, this.deps.now()));
-      commit(
-        finishRun(record, "failed", this.deps.now(), {
-          code: outcome.error.code,
-          message: outcome.error.message,
-          nodeId,
-        }),
-      );
-      return record;
     }
   }
 
@@ -126,20 +215,30 @@ export class WorkflowExecutor {
     record: WorkflowRun,
     nodeId: NodeId,
     attempt: number,
-  ): Promise<{ ok: true; output: JsonValue } | { ok: false; error: NodeError }> {
+    signal: AbortSignal,
+  ): Promise<Outcome> {
     const spec = definition.graph.nodes.find((node) => node.id === nodeId);
     const handler = spec && definition.handlers[spec.handler];
-    if (!spec || !handler) throw new UmioError(`No handler for node "${nodeId}".`); // validated earlier
-
+    if (!spec || !handler) {
+      return {
+        ok: false,
+        error: {
+          code: "handler-missing",
+          message: `No handler for "${nodeId}".`,
+          retryable: false,
+        },
+      };
+    }
+    const maxOutputBytes = spec.maxOutputBytes ?? this.maxOutputBytes;
     const context: NodeContext = {
       runId: record.runId,
       nodeId,
       attempt,
       input: record.input,
       predecessors: predecessorOutputs(definition.graph, record, nodeId),
-      signal: new AbortController().signal,
+      signal,
       idempotencyKey: `${record.runId}:${nodeId}`,
-      limits: { maxOutputBytes: spec.maxOutputBytes ?? this.maxOutputBytes },
+      limits: { maxOutputBytes },
       emit: (event) => {
         try {
           this.options.onNodeEvent?.(nodeId, attempt, event);
@@ -155,28 +254,12 @@ export class WorkflowExecutor {
     } catch (error) {
       return { ok: false, error: toNodeError(error) };
     }
-    if (!isJsonValue(output)) {
-      return {
-        ok: false,
-        error: {
-          code: "output-not-json",
-          message: `Node "${nodeId}" returned a value that is not JSON; its side effects, if any, may already have happened (idempotency key ${context.idempotencyKey}).`,
-          retryable: false,
-        },
-      };
-    }
-    return { ok: true, output };
-  }
-}
-
-/** Features validated as correct but not executable until later phases. */
-function assertSupported(definition: WorkflowDefinition): void {
-  const { graph } = definition;
-  if (graph.edges.some((edge) => edge.when !== undefined)) {
-    throw new GraphUnsupportedError("Conditional edges (`when`) are not supported yet.");
-  }
-  if (graph.nodes.some((node) => node.join === "any")) {
-    throw new GraphUnsupportedError('`join: "any"` is not supported yet.');
+    const invalid = checkOutput(output, {
+      maxOutputBytes,
+      nodeId,
+      idempotencyKey: context.idempotencyKey,
+    });
+    return invalid ? { ok: false, error: invalid } : { ok: true, output: output as JsonValue };
   }
 }
 
@@ -190,4 +273,21 @@ export function toNodeError(error: unknown): NodeError {
   }
   if (error instanceof LLMError) return { code: "llm-error", message, retryable: error.retryable };
   return { code: "handler-error", message, retryable: false };
+}
+
+function failureReason(nodeId: NodeId): Error {
+  return new UmioError(`Run stopped: node "${nodeId}" failed.`);
+}
+
+function positiveInt(value: number, name: string): number {
+  if (!Number.isInteger(value) || value < 1) {
+    throw new UmioError(`${name} must be a positive integer, got ${value}.`);
+  }
+  return value;
+}
+
+function definedOnly<T extends object>(value: T): Partial<T> {
+  return Object.fromEntries(
+    Object.entries(value).filter(([, item]) => item !== undefined),
+  ) as Partial<T>;
 }

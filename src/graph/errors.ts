@@ -21,6 +21,3 @@ export class GraphNodeError extends UmioError {
     this.retryable = details.retryable ?? false;
   }
 }
-
-/** The executor was asked for a capability that a later phase adds. */
-export class GraphUnsupportedError extends UmioError {}

@@ -387,6 +387,76 @@ Files are read as `NNNN-*.md`. The status comes from a `## Status` section or a 
 
 ---
 
+### Graph workflows (in progress)
+
+`WorkflowExecutor` runs a directed acyclic graph of nodes: branches, parallel paths and joins. It is being built in phases (see `docs/work/umio-graph-workflow-plan.md`). **Runs are currently kept in memory only**; checkpoints, resumption, retries, timeouts and cancellation come in later phases.
+
+```typescript
+import { agentNode, WorkflowExecutor, type WorkflowDefinition } from "umio";
+
+const definition: WorkflowDefinition = {
+  graph: {
+    id: "architecture-review",
+    version: "1",                       // bump when node behavior changes
+    entry: ["research"],
+    nodes: [
+      { id: "research", handler: "research" },
+      { id: "design", handler: "design" },
+      { id: "security", handler: "security" },
+      { id: "merge", handler: "merge" },   // join "all" by default
+    ],
+    edges: [
+      { from: "research", to: "design" },
+      { from: "research", to: "security", when: "flagsRisk" },
+      { from: "design", to: "merge" },
+      { from: "security", to: "merge" },
+    ],
+  },
+  handlers: {
+    research: agentNode(researcher, { llm }),
+    design: agentNode(designer, { llm }),
+    security: agentNode(securityReviewer, { llm }),
+    merge: agentNode(editor, { llm }),
+  },
+  predicates: { flagsRisk: (output) => /RISK: yes/i.test((output as { text: string }).text) },
+};
+
+const run = await WorkflowExecutor.fromConfig(llm.config).run(definition, "Review this plan: …");
+run.status;               // "completed" | "failed"
+run.nodes.merge?.output;  // { text, usage } from agentNode
+```
+
+**Definitions and validation**
+- The graph is plain JSON. Handlers and predicates are registered by key, and `validateDefinition` runs before every run.
+- Validation reports every problem at once: cycles, unknown nodes or handlers, unreachable nodes, invalid joins, non-JSON values.
+- Each run records the definition's `version` and a `definitionHash`.
+
+**Handlers**
+- A handler receives the run `input`, the outputs of its active `predecessors`, an abort `signal`, and a stable `idempotencyKey`. It returns JSON.
+- `agentNode(agent, { llm, … })` runs an agent as a node. Its default task is the run input followed by the predecessors' results.
+
+**Branches and joins**
+- An edge with `when` is active only if its predicate returns true. Predicates are pure, synchronous and evaluated once, and the decision is recorded.
+- Nodes whose incoming edges are all inactive are **skipped**, transitively.
+- `join: "all"` (default) waits for every active incoming edge. `join: "any"` runs once, on the first predecessor to complete, and that choice never changes.
+
+**Concurrency**
+- `maxConcurrency` limits how many nodes run at once. Settings apply in this order, highest first: the run option, the constructor option, the config's `graph.maxConcurrency`, then the default of 4.
+- Use `1` for a single local model.
+- It does not limit model calls made inside a node; the provider's `maxConcurrentRequests` does.
+
+**Failures**
+- A handler error is recorded on the node, and the run resolves with status `failed`, not an exception.
+- The other running nodes are aborted and recorded as `cancelled`, and nothing new starts.
+
+**Outputs**
+- Outputs must be JSON and at most `maxOutputBytes` (default 256 KiB; configurable per executor, per node, or in the config's `graph` section).
+- For larger results, store the data yourself and return an `ArtifactRef` (`{ $artifact: { uri, sha256, bytes, mediaType? } }`). umio never reads or deletes artifacts; retention is yours, and `collectArtifactRefs(run)` lists them.
+
+The sequential `Workflow` above runs on the same executor internally, with unchanged behavior.
+
+---
+
 ## Built-in tools
 
 Each group is a function returning ordinary `Tool`s, so they combine with toolsets, hooks, harnesses and agents like any other tool.
@@ -613,6 +683,7 @@ npm run example -- local "Hello"   # call a model from ./umio.config.json
 npm run example:tools -- local     # streaming tool loop (UMIO_CONFIG=path to use another config)
 npm run example:workflow -- local  # two-agent workflow with ADRs
 npm run example:project -- local   # agent answering questions about this repo with built-in tools
+npm run example:graph -- local     # diamond review graph with a conditional branch
 ```
 
 Run a single test file or test name:

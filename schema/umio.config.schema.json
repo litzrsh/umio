@@ -472,6 +472,22 @@
       ],
       "additionalProperties": false
     },
+    "graph": {
+      "type": "object",
+      "properties": {
+        "maxConcurrency": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "maxOutputBytes": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "additionalProperties": false
+    },
     "tools": {
       "type": "object",
       "propertyNames": {

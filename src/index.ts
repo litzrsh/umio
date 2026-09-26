@@ -12,6 +12,7 @@ export {
 export {
   type AdrConfig,
   type AnthropicProviderConfig,
+  type GraphConfig,
   type HarnessConfig,
   type MiddlewareSpec,
   type ModelConfig,

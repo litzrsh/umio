@@ -13,7 +13,8 @@
 | P0: Characterization tests | Done (`669c0b4`); `test/workflow-compat.test.ts` |
 | P-T: Provider and transport time limits, `maxConcurrentRequests` | Done; `test/local-providers.test.ts` (classification, defaults, a real HTTP server for header timeouts, retries and aborts, and the limiter). Verified live against local Ollama. |
 | P1: Types, validation, identity, planning, adapter | Done; `src/graph/` (types, errors, runtime, identity, validate, plan, executor), `src/agents/adr-context.ts`, `Workflow.run()` on the executor. Tests in `test/graph.test.ts`; the P0 suite passes unchanged. Verified live with `examples/workflow.ts` on local Ollama. The executor stays internal until P3/P4; conditional edges and `join: "any"` validate but are rejected at run time until P2. |
-| P2–P5 | Not started |
+| P2: DAG execution | Done; predicates (evaluated once), transitive skips, `join: "all"`/`"any"` with a fixed `selectedPredecessor`, the concurrency limit with D14 precedence (config `graph.maxConcurrency` / `maxOutputBytes`, `WorkflowExecutor.fromConfig`), output checks (`output-not-json`, `output-too-large`), `ArtifactRef` helpers and `agentNode`. On node failure, siblings are aborted and recorded `cancelled` (the grace period and abandonment come in P5). `WorkflowExecutor` is now exported. Tests in `test/graph-dag.test.ts`, mutation-checked. Verified live with `examples/graph.ts` on local Ollama (the conditional branch was skipped). |
+| P3–P5 | Not started |
 
 ### Changes in revision 4
 

@@ -4,7 +4,6 @@ import { readyNodes } from "../src/graph/plan.js";
 import {
   definitionHash,
   GraphNodeError,
-  GraphUnsupportedError,
   GraphValidationError,
   type JsonValue,
   LLMError,
@@ -313,7 +312,7 @@ describe("definitionHash", () => {
   });
 });
 
-describe("WorkflowExecutor (P1: sequential, in memory)", () => {
+describe("WorkflowExecutor (sequential behavior)", () => {
   let clock = 1_000;
   let ids = 0;
   const executor = (options = {}) =>
@@ -379,7 +378,7 @@ describe("WorkflowExecutor (P1: sequential, in memory)", () => {
     expect(run.updatedAt).toBeGreaterThan(run.createdAt);
   });
 
-  it("records a node failure as data and does not start later nodes", async () => {
+  it("records a node failure as data and, run sequentially, starts no later nodes", async () => {
     const def = diamond();
     const handlers = {
       ...def.handlers,
@@ -389,7 +388,7 @@ describe("WorkflowExecutor (P1: sequential, in memory)", () => {
       security: vi.fn(noop),
     };
 
-    const run = await executor().run({ ...def, handlers }, null);
+    const run = await executor({ maxConcurrency: 1 }).run({ ...def, handlers }, null);
 
     expect(run.status).toBe("failed");
     expect(run.error).toEqual({ code: "quota", message: "quota exceeded", nodeId: "design" });
@@ -465,27 +464,17 @@ describe("WorkflowExecutor (P1: sequential, in memory)", () => {
     expect(events).toEqual([["a", 1, { type: "custom", name: "progress", data: 1 }]]);
   });
 
-  it("rejects invalid definitions, non-JSON input and not-yet-supported features", async () => {
+  it("rejects invalid definitions, non-JSON input and invalid options", async () => {
     await expect(
       executor().run(definition({ entry: ["x"], nodes: [], edges: [] }), null),
     ).rejects.toBeInstanceOf(GraphValidationError);
     await expect(
       executor().run(diamond(), { when: undefined } as unknown as JsonValue),
     ).rejects.toThrow(/JSON/);
-    const branching = definition(
-      {
-        entry: ["a"],
-        nodes: [
-          { id: "a", handler: "h" },
-          { id: "b", handler: "h" },
-        ],
-        edges: [{ from: "a", to: "b", when: "p" }],
-      },
-      {},
-      { p: () => true },
+    expect(() => new WorkflowExecutor({ maxConcurrency: 0 })).toThrow(/maxConcurrency/);
+    await expect(executor().run(diamond(), null, { maxConcurrency: 1.5 })).rejects.toThrow(
+      /maxConcurrency/,
     );
-    await expect(executor().run(branching, null)).rejects.toBeInstanceOf(GraphUnsupportedError);
-    expect(() => new WorkflowExecutor({ maxConcurrency: 4 })).toThrow(GraphUnsupportedError);
   });
 });
 

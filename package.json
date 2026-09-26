@@ -39,6 +39,7 @@
     "example:tools": "tsx examples/tools.ts",
     "example:workflow": "tsx examples/workflow.ts",
     "example:project": "tsx examples/project.ts",
+    "example:graph": "tsx examples/graph.ts",
     "test:watch": "vitest",
     "schema": "tsx scripts/generate-schema.ts",
     "prepublishOnly": "npm run schema && npm run build"

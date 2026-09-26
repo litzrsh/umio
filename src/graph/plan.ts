@@ -1,13 +1,19 @@
 /**
  * Pure scheduling over a run record: which nodes are ready, what a node's
- * success changes, and whether the run is finished. No I/O, no clocks beyond
+ * success changes, and whether the run is finished. No I/O and no clock beyond
  * the `now` argument, so every rule can be tested exhaustively.
+ *
+ * Edge decisions are made exactly once, when the source node completes (or is
+ * skipped), and recorded in `run.edges`. Readiness, skips and join selection
+ * are derived from those recorded decisions only, never re-evaluated (I3).
  */
-
 import type {
+  EdgeSpec,
   JsonValue,
+  NodeError,
   NodeId,
   NodeRun,
+  NodeSpec,
   WorkflowDefinition,
   WorkflowGraph,
   WorkflowRun,
@@ -42,8 +48,11 @@ export function createRun(options: {
 }
 
 /**
- * Nodes that may start now, in declaration order: pending, past any `retryAt`,
- * and (for `join: "all"`) every incoming edge decided active with a completed source.
+ * Nodes that may start now, in declaration order. A node is ready when it is
+ * pending, past any `retryAt`, and:
+ * - it has no incoming edges (entry node), or
+ * - `join: "any"`: a predecessor has been selected, or
+ * - `join: "all"` (default): every incoming edge is decided and at least one is active.
  */
 export function readyNodes(graph: WorkflowGraph, run: WorkflowRun, now: number): NodeId[] {
   return graph.nodes
@@ -51,74 +60,130 @@ export function readyNodes(graph: WorkflowGraph, run: WorkflowRun, now: number):
       const state = run.nodes[node.id];
       if (state?.status !== "pending") return false;
       if (state.retryAt !== undefined && state.retryAt > now) return false;
-      return incomingEdges(graph, node.id).every(
-        (edge) =>
-          run.edges[edgeKey(edge.from, edge.to)] === true &&
-          run.nodes[edge.from]?.status === "completed",
-      );
+      const incoming = incomingEdges(graph, node.id);
+      if (incoming.length === 0) return true;
+      if (node.join === "any") return state.selectedPredecessor !== undefined;
+      const decisions = incoming.map((edge) => run.edges[edgeKey(edge.from, edge.to)]);
+      return decisions.every((decision) => decision !== undefined) && decisions.includes(true);
     })
     .map((node) => node.id);
 }
 
-/** Outputs of completed predecessors whose edge to `nodeId` is active, keyed in node-ID order. */
+/**
+ * The `predecessors` a node receives: for `join: "any"`, only the selected
+ * predecessor; otherwise every completed source of an active edge, keyed in node-ID order.
+ */
 export function predecessorOutputs(
   graph: WorkflowGraph,
   run: WorkflowRun,
   nodeId: NodeId,
 ): Record<NodeId, JsonValue> {
+  const selected = run.nodes[nodeId]?.selectedPredecessor;
+  const sources =
+    selected !== undefined
+      ? [selected]
+      : incomingEdges(graph, nodeId)
+          .filter(
+            (edge) =>
+              run.edges[edgeKey(edge.from, edge.to)] === true &&
+              run.nodes[edge.from]?.status === "completed",
+          )
+          .map((edge) => edge.from)
+          .sort();
   const outputs: Record<NodeId, JsonValue> = {};
-  const sources = incomingEdges(graph, nodeId)
-    .filter(
-      (edge) =>
-        run.edges[edgeKey(edge.from, edge.to)] === true &&
-        run.nodes[edge.from]?.status === "completed",
-    )
-    .map((edge) => edge.from)
-    .sort();
   for (const source of sources) outputs[source] = run.nodes[source]?.output ?? null;
   return outputs;
+}
+
+/**
+ * Decides a completed node's outgoing edges. Predicates are pure and synchronous;
+ * one that throws or returns a non-boolean fails the node (`predicate-error`).
+ */
+export function decideEdges(
+  definition: WorkflowDefinition,
+  run: WorkflowRun,
+  nodeId: NodeId,
+  output: JsonValue,
+): { ok: true; decisions: Record<string, boolean> } | { ok: false; error: NodeError } {
+  const decisions: Record<string, boolean> = {};
+  for (const edge of outgoingEdges(definition.graph, nodeId)) {
+    if (edge.when === undefined) {
+      decisions[edgeKey(edge.from, edge.to)] = true;
+      continue;
+    }
+    let decision: unknown;
+    try {
+      decision = definition.predicates[edge.when]?.(output, run.input);
+    } catch (error) {
+      return { ok: false, error: predicateError(edge, error) };
+    }
+    if (typeof decision !== "boolean") {
+      return {
+        ok: false,
+        error: predicateError(edge, `returned ${typeof decision}, expected boolean`),
+      };
+    }
+    decisions[edgeKey(edge.from, edge.to)] = decision;
+  }
+  return { ok: true, decisions };
 }
 
 /** W1: the attempt is recorded before the handler is invoked. */
 export function startAttempt(run: WorkflowRun, nodeId: NodeId, now: number): WorkflowRun {
   const node = requireNode(run, nodeId);
   const { retryAt: _, ...rest } = node;
-  return withNode(
-    run,
-    { ...rest, status: "running", attempt: node.attempt + 1, startedAt: now },
+  return bump(
+    withNode(run, { ...rest, status: "running", attempt: node.attempt + 1, startedAt: now }),
     now,
   );
 }
 
 /**
- * W2: output, completion and the node's outgoing edge decisions, in one change.
- * P1 supports unconditional edges only, so every outgoing edge becomes active.
+ * W2, as one change: the node's output and completion, its edge decisions,
+ * `selectedPredecessor` for `join: "any"` targets reached through an active
+ * edge, and every resulting skip, transitively.
  */
 export function completeNode(
   graph: WorkflowGraph,
   run: WorkflowRun,
   nodeId: NodeId,
   output: JsonValue,
+  decisions: Record<string, boolean>,
   now: number,
 ): WorkflowRun {
   const node = requireNode(run, nodeId);
-  const edges = { ...run.edges };
-  for (const edge of graph.edges) {
-    if (edge.from === nodeId) edges[edgeKey(edge.from, edge.to)] = true;
+  let next = withNode(run, { ...node, status: "completed", output, finishedAt: now });
+  next = { ...next, edges: { ...next.edges, ...decisions } };
+  for (const edge of outgoingEdges(graph, nodeId)) {
+    if (decisions[edgeKey(edge.from, edge.to)] !== true) continue;
+    const target = requireNode(next, edge.to);
+    const spec = requireSpec(graph, edge.to);
+    if (
+      spec.join === "any" &&
+      target.status === "pending" &&
+      target.selectedPredecessor === undefined
+    ) {
+      next = withNode(next, { ...target, selectedPredecessor: nodeId });
+    }
   }
-  const next = withNode(run, { ...node, status: "completed", output, finishedAt: now }, now);
-  return { ...next, edges };
+  return bump(propagateSkips(graph, next, now), now);
 }
 
-/** W3 without retries: the node fails. */
+/** W3 (no retry): the node fails. */
 export function failNode(
   run: WorkflowRun,
   nodeId: NodeId,
-  error: { code: string; message: string; retryable: boolean },
+  error: NodeError,
   now: number,
 ): WorkflowRun {
   const node = requireNode(run, nodeId);
-  return withNode(run, { ...node, status: "failed", error, finishedAt: now }, now);
+  return bump(withNode(run, { ...node, status: "failed", error, finishedAt: now }), now);
+}
+
+/** W4: an attempt stopped because the run is failing or being cancelled. */
+export function cancelAttempt(run: WorkflowRun, nodeId: NodeId, now: number): WorkflowRun {
+  const node = requireNode(run, nodeId);
+  return bump(withNode(run, { ...node, status: "cancelled", finishedAt: now }), now);
 }
 
 /** W5: the run's terminal status. */
@@ -128,7 +193,7 @@ export function finishRun(
   now: number,
   error?: WorkflowRun["error"],
 ): WorkflowRun {
-  return { ...run, status, revision: run.revision + 1, updatedAt: now, ...(error && { error }) };
+  return bump({ ...run, status, ...(error && { error }) }, now);
 }
 
 /** True when every node is completed or skipped. */
@@ -138,8 +203,49 @@ export function allNodesDone(run: WorkflowRun): boolean {
   );
 }
 
-function incomingEdges(graph: WorkflowGraph, nodeId: NodeId) {
+/**
+ * Skips every pending node whose incoming edges are all decided and inactive,
+ * and decides that node's outgoing edges inactive, until nothing changes.
+ */
+function propagateSkips(graph: WorkflowGraph, run: WorkflowRun, now: number): WorkflowRun {
+  let next = run;
+  for (let changed = true; changed; ) {
+    changed = false;
+    for (const spec of graph.nodes) {
+      const node = next.nodes[spec.id];
+      if (node?.status !== "pending") continue;
+      const incoming = incomingEdges(graph, spec.id);
+      if (incoming.length === 0) continue;
+      const decisions = incoming.map((edge) => next.edges[edgeKey(edge.from, edge.to)]);
+      if (!decisions.every((decision) => decision === false)) continue;
+      const edges = { ...next.edges };
+      for (const edge of outgoingEdges(graph, spec.id)) edges[edgeKey(edge.from, edge.to)] = false;
+      next = { ...withNode(next, { ...node, status: "skipped", finishedAt: now }), edges };
+      changed = true;
+    }
+  }
+  return next;
+}
+
+function predicateError(edge: EdgeSpec, reason: unknown): NodeError {
+  const message = reason instanceof Error ? reason.message : String(reason);
+  return {
+    code: "predicate-error",
+    message:
+      `Predicate "${edge.when}" on edge ${edgeKey(edge.from, edge.to)} failed: ${message}`.slice(
+        0,
+        1_000,
+      ),
+    retryable: false,
+  };
+}
+
+function incomingEdges(graph: WorkflowGraph, nodeId: NodeId): EdgeSpec[] {
   return graph.edges.filter((edge) => edge.to === nodeId);
+}
+
+function outgoingEdges(graph: WorkflowGraph, nodeId: NodeId): EdgeSpec[] {
+  return graph.edges.filter((edge) => edge.from === nodeId);
 }
 
 function requireNode(run: WorkflowRun, nodeId: NodeId): NodeRun {
@@ -148,11 +254,17 @@ function requireNode(run: WorkflowRun, nodeId: NodeId): NodeRun {
   return node;
 }
 
-function withNode(run: WorkflowRun, node: NodeRun, now: number): WorkflowRun {
-  return {
-    ...run,
-    nodes: { ...run.nodes, [node.nodeId]: node },
-    revision: run.revision + 1,
-    updatedAt: now,
-  };
+function requireSpec(graph: WorkflowGraph, nodeId: NodeId): NodeSpec {
+  const spec = graph.nodes.find((node) => node.id === nodeId);
+  if (!spec) throw new Error(`Unknown node "${nodeId}".`);
+  return spec;
+}
+
+function withNode(run: WorkflowRun, node: NodeRun): WorkflowRun {
+  return { ...run, nodes: { ...run.nodes, [node.nodeId]: node } };
+}
+
+/** One revision per recorded change. */
+function bump(run: WorkflowRun, now: number): WorkflowRun {
+  return { ...run, revision: run.revision + 1, updatedAt: now };
 }
