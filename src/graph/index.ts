@@ -5,7 +5,11 @@ export {
   agentNode,
   defaultTask,
 } from "./agent-node.js";
-export { FileCheckpointStore, type FileCheckpointStoreOptions } from "./checkpoint/file.js";
+export {
+  FileCheckpointStore,
+  type FileCheckpointStoreOptions,
+  type StoredRunSnapshot,
+} from "./checkpoint/file.js";
 export {
   MemoryCheckpointStore,
   type MemoryCheckpointStoreOptions,

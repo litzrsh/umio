@@ -28,6 +28,8 @@
 
 - **Built-in tools** for files, the web, command-line programs, SQL databases and utilities, each with safe defaults and configurable per project in JSON.
 
+- **`umio` command-line interface.** Chat with a configured model and its tools, run one-shot prompts from scripts, check your setup with `umio doctor`, and run, inspect, cancel, resume and recover graph workflows. Built for multi-hour local calls.
+
 - **Graph workflows.** Branches, parallel nodes and joins, with retries, node timeouts, cancellation and observers. Every step is checkpointed, so a run survives a crash: completed nodes never re-run, and nodes whose outcome is unknown wait for an explicit recovery decision. Sized for local models where one call takes hours.
 
 **Planned**
@@ -46,6 +48,112 @@ npm run build
 ```
 
 Requires Node.js 20 or newer.
+
+This also builds the `umio` command (`dist/cli.js`, registered under `bin` in `package.json`). To use it from anywhere, run `npm link` in the repository; without linking, run `node dist/cli.js …`, or `npm run cli -- …` to run it from source.
+
+---
+
+## Command-line interface
+
+The `umio` command is a thin layer over the library: the same config, `LLM`, `Agent` and `WorkflowExecutor`. It adds no dependencies. Arguments are parsed with `node:util`, line editing uses `node:readline`, and output uses a few ANSI escape codes.
+
+### Getting started
+
+```bash
+umio init                    # writes umio.config.json for a local Ollama model (llama3.2)
+ollama pull llama3.2
+umio doctor                  # checks the config, the model, the server and the time limits
+umio                         # interactive session
+umio ask "What does this repository do?"
+```
+
+`umio init --local-model qwen3:8b` picks another model. The config is looked up in this order: `--config <file>`, `$UMIO_CONFIG`, then `umio.config.json` in the working directory or the nearest parent. Everything else in this README about `umio.config.json` applies unchanged.
+
+### Interactive session
+
+```
+umio · model local (llama3.2, local) · tools: repo, misc · /help · Ctrl+D to exit
+› Which files define the tool loop?
+  ⚙ search_files query=runToolLoop
+  ✓ search_files · 14ms · 1.2 kB
+The tool loop lives in src/tools/loop.ts …
+· 41s · in 1.8k out 212 tokens
+```
+
+- Model text streams as it arrives. Each tool call gets one line while it runs and one when it finishes (`✓`, `✗` with the first line of the error, or `–` when it was not run). `--verbose` adds result previews.
+- Tools not marked read-only ask first: `[y]es [n]o [a]lways` (always means this tool, for the rest of the session). `--yes` approves everything.
+- **Keys:** `Esc` or `Ctrl+C` cancel the running operation and never exit. On an idle prompt, `Ctrl+C` clears the line, and `Ctrl+D` or `/exit` exits.
+- **Commands:** `/help`, `/model [alias]`, `/config`, `/session`, `/tools`, `/new` (fresh transcript), `/cancel`, `/exit`, and `/graph …`, which is the same as `umio graph …`.
+- **Cancelling a turn never makes a tool run twice.** If no tool had run, the turn is undone and your message goes back on the prompt. If tools did run, the transcript keeps their results, a tool cut off mid-run is recorded as "outcome unknown", and your next message tells the model what already happened. Nothing is re-sent automatically.
+- Sessions live in memory; `/new` or exiting discards them.
+
+### Scripts and pipes
+
+```bash
+umio ask "Summarize CHANGELOG.md" > summary.txt
+git diff | umio ask --tools none --json | jq -r .text
+```
+
+- `umio ask` reads the prompt from its arguments, or from stdin if there are none.
+- Model text goes to stdout. Tool lines, heartbeats and errors go to stderr.
+- `--json` prints one object: `text`, `stopReason`, `model`, `usage`, and `tools` (name, input, whether it errored, duration).
+- `--quiet` prints only results and errors.
+- `--no-color` (or `NO_COLOR=1`) gives plain text. Statuses always pair a symbol with a word (`✓ completed`, `? uncertain`), so no information depends on color, and `TERM=dumb` switches to ASCII symbols.
+- Without a terminal, tools that may change things are declined unless you pass `--yes`.
+- Exit codes: 0 ok, 1 error or failed run, 2 usage error, 3 run needs recovery, 130 cancelled.
+
+`umio config`, `umio models` and `umio tools` show what is configured (`--json` for machines). Literal secrets are masked.
+
+### Long-running local models
+
+A local model can spend two or three hours on one request before it produces any text, and umio treats that as normal:
+
+- In a terminal, a status line shows the elapsed time: `⠼ waiting for model · 1h 12m · no output yet — still running`. After a minute without output it says when output last arrived.
+- Without a terminal, a heartbeat line (`umio: still running · …`) goes to stderr every 5 minutes (`--heartbeat 1m` to change it; `--quiet` turns it off).
+- These displays run on their own UI timer. They never end, time out or retry anything. Only the configured provider and node timeouts can end a call, and lease renewal runs on its own timer.
+
+**The graph node timeout (3 h by default) covers the whole node attempt.** For an agent node that is the entire agent run, including every model call and every tool call. An agent that makes three 2-hour local requests needs a per-node `timeoutMs` of at least 6 h, or `null`. Keep the provider's `timeoutMs` and transport timeouts sized for one request. See [Time limits for long local runs](#local-providers).
+
+`umio doctor --node-timeout 6h` checks that no local provider ends a request before that duration, and explains when that is expected.
+
+### Graph workflows from the command line
+
+A workflow module is an ES module whose default export is a `WorkflowDefinition`, or a function that receives the CLI's model client and config:
+
+```js
+// review.workflow.mjs (see examples/review.workflow.mjs)
+import { Agent, agentNode } from "umio";
+
+export default ({ llm }) => ({
+  graph: {
+    id: "review", version: "1", entry: ["draft"],
+    nodes: [{ id: "draft", handler: "draft", timeoutMs: 6 * 60 * 60 * 1000 }],
+    edges: [],
+  },
+  handlers: {
+    draft: agentNode(new Agent({ name: "Writer", role: "Drafts replies." }), { llm, stream: true }),
+  },
+  predicates: {},
+});
+```
+
+```bash
+umio graph run review.workflow.mjs --input "Store uploads on local disk?"   # prints the run ID and a node table
+umio graph status <run-id>             # nodes, attempts, owner, and nodes needing recovery
+umio graph list [--needs-recovery]
+umio graph cancel <run-id>
+umio graph resume review.workflow.mjs <run-id>
+umio graph recover review.workflow.mjs <run-id> <node-id> --retry
+umio graph recover review.workflow.mjs <run-id> <node-id> --complete '{"text":"…"}'
+umio graph recover review.workflow.mjs <run-id> <node-id> --fail --reason "charged twice; refunded"
+```
+
+- **Where runs are kept:** in `.umio/runs` next to the config (`--store <dir>` to change it), using the experimental `FileCheckpointStore`. It is single-process. `status` and `list` read it while another `umio` process is running a workflow; `cancel`, `resume` and `recover` wait for that process to finish.
+- **Ctrl+C during `run` or `resume`:** the first press cancels the run explicitly. The cancel is recorded, and running nodes get their grace period. A second press exits at once without finalizing. `graph status` then shows the run as interrupted, and `graph resume` marks its running nodes uncertain instead of running them again. SIGTERM behaves like the second press.
+- **Nodes needing recovery:** `status` and `run` list every `uncertain` node with its reason, attempt and idempotency key, say plainly that its side effects may have happened, and print the three explicit `recover` commands. umio never picks one, and never retries an uncertain node automatically.
+- The module must import `umio` from the same installation as the command (run the CLI with `npx umio` in the project that depends on it), so both share one copy of the library.
+- The module must be `.mjs`/`.js` ESM. A `.ts` module needs Node's type stripping (Node 22.18 or newer).
+- `--model <alias>` becomes the default model for agents that don't name one.
 
 ---
 

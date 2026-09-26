@@ -1,12 +1,25 @@
 import { defineConfig } from "tsup";
 
-export default defineConfig({
-  entry: ["src/index.ts"],
-  format: ["esm", "cjs"],
-  // tsup's declaration build injects `baseUrl`, which TypeScript 6 deprecates.
-  // TypeScript 7 (native) has no JS API, so tsup cannot generate declarations with it.
-  dts: { compilerOptions: { ignoreDeprecations: "6.0" } },
-  sourcemap: true,
-  clean: true,
-  target: "node20",
-});
+// tsup's declaration build injects `baseUrl`, which TypeScript 6 deprecates.
+// TypeScript 7 (native) has no JS API, so tsup cannot generate declarations with it.
+const dtsOptions = { compilerOptions: { ignoreDeprecations: "6.0" } };
+
+export default defineConfig([
+  {
+    // ESM: the library and the `umio` CLI share chunks, so a workflow module
+    // that imports "umio" gets the same classes as the CLI running it.
+    entry: { index: "src/index.ts", cli: "src/cli/main.ts" },
+    format: ["esm"],
+    splitting: true,
+    dts: { entry: "src/index.ts", ...dtsOptions },
+    sourcemap: true,
+    target: "node20",
+  },
+  {
+    entry: { index: "src/index.ts" },
+    format: ["cjs"],
+    dts: { entry: "src/index.ts", ...dtsOptions },
+    sourcemap: true,
+    target: "node20",
+  },
+]);

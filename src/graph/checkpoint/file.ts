@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, open, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { UmioError } from "../../errors.js";
 import {
@@ -28,6 +28,14 @@ export interface FileCheckpointStoreOptions {
   dir: string;
   /** The store's clock for lease expiry. Default `Date.now`. */
   now?(): number;
+}
+
+/** A read-only view of one stored run: the record plus its lease and control state. */
+export interface StoredRunSnapshot {
+  readonly record: WorkflowRun;
+  readonly cancelRequested: boolean;
+  /** The lease as last written; compare `expiresAt` with the current time. */
+  readonly lease?: { readonly ownerId: string; readonly expiresAt: number };
 }
 
 /** Directories held by open stores in this process. */
@@ -78,6 +86,32 @@ export class FileCheckpointStore implements CheckpointStore {
       throw error;
     }
     return store;
+  }
+
+  /**
+   * Reads one run without opening the store, so it works while another
+   * process holds the directory (writes are atomic renames, so a read sees a
+   * whole file). For inspection only: it takes no lease and never writes.
+   */
+  static async snapshot(dir: string, runId: string): Promise<StoredRunSnapshot | undefined> {
+    return readSnapshot(join(resolve(dir), fileName(runId)));
+  }
+
+  /** Every run in the directory, read as by {@link FileCheckpointStore.snapshot}. */
+  static async snapshots(dir: string): Promise<StoredRunSnapshot[]> {
+    let names: string[];
+    try {
+      names = await readdir(resolve(dir));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw error;
+    }
+    const runs: StoredRunSnapshot[] = [];
+    for (const name of names.filter((item) => item.endsWith(".run.json")).sort()) {
+      const run = await readSnapshot(join(resolve(dir), name));
+      if (run) runs.push(run);
+    }
+    return runs;
   }
 
   /** Releases the directory claim. The instance cannot be used afterwards. */
@@ -218,8 +252,7 @@ export class FileCheckpointStore implements CheckpointStore {
   }
 
   private fileFor(runId: string): string {
-    // encodeURIComponent leaves no path separators; the suffix keeps "." and ".." ordinary names.
-    return join(this.dir, `${encodeURIComponent(runId)}.run.json`);
+    return join(this.dir, fileName(runId));
   }
 
   private isCurrent(entry: Entry, lease: Lease): boolean {
@@ -229,6 +262,30 @@ export class FileCheckpointStore implements CheckpointStore {
       entry.lease.expiresAt > this.now()
     );
   }
+}
+
+function fileName(runId: string): string {
+  // encodeURIComponent leaves no path separators; the suffix keeps "." and ".." ordinary names.
+  return `${encodeURIComponent(runId)}.run.json`;
+}
+
+async function readSnapshot(file: string): Promise<StoredRunSnapshot | undefined> {
+  let text: string;
+  try {
+    text = await readFile(file, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+  const entry = JSON.parse(text) as Entry;
+  assertCheckpointSchema(entry.record);
+  return {
+    record: entry.record,
+    cancelRequested: entry.cancelRequested,
+    ...(entry.lease && {
+      lease: { ownerId: entry.lease.ownerId, expiresAt: entry.lease.expiresAt },
+    }),
+  };
 }
 
 function isAlive(pid: number): boolean {

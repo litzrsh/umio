@@ -10,6 +10,9 @@
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "bin": {
+    "umio": "./dist/cli.js"
+  },
   "exports": {
     ".": {
       "import": {
@@ -29,7 +32,7 @@
     "schema"
   ],
   "scripts": {
-    "build": "tsup",
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsup",
     "dev": "tsup --watch",
     "typecheck": "tsc --noEmit",
     "lint": "biome check .",
@@ -42,7 +45,8 @@
     "example:graph": "tsx examples/graph.ts",
     "test:watch": "vitest",
     "schema": "tsx scripts/generate-schema.ts",
-    "prepublishOnly": "npm run schema && npm run build"
+    "prepublishOnly": "npm run schema && npm run build",
+    "cli": "tsx src/cli/main.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.128.0",

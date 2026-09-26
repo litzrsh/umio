@@ -65,6 +65,30 @@ describe("FileCheckpointStore", () => {
     );
   });
 
+  it("snapshots read runs without opening the store, while another instance holds it", async () => {
+    const dir = await tempDir();
+    const store = await openStore(dir, () => 1_000);
+    const lease = await store.create(record, "owner-a", 30_000);
+    await store.create({ ...record, runId: "other" }, "owner-a", 30_000);
+    await store.releaseLease({ ...lease, runId: "other", token: 1 });
+    await store.requestCancel(record.runId);
+
+    await expect(FileCheckpointStore.snapshot(dir, record.runId)).resolves.toEqual({
+      record,
+      cancelRequested: true,
+      lease: { ownerId: "owner-a", expiresAt: 31_000 },
+    });
+    const all = await FileCheckpointStore.snapshots(dir);
+    expect(all.map((run) => [run.record.runId, run.lease?.ownerId])).toEqual([
+      ["../run/1", "owner-a"],
+      ["other", undefined],
+    ]);
+    await expect(FileCheckpointStore.snapshot(dir, "missing")).resolves.toBeUndefined();
+    await expect(FileCheckpointStore.snapshots(join(dir, "nowhere"))).resolves.toEqual([]);
+    // The holder is unaffected.
+    await expect(store.load(record.runId)).resolves.toEqual(record);
+  });
+
   it("keeps run IDs inside the directory and leaves no temporary files", async () => {
     const dir = await tempDir();
     const store = await openStore(dir);
