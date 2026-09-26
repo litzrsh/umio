@@ -36,13 +36,16 @@ umio graph list [--needs-recovery]
 umio graph resume <module> <run-id>
 umio graph cancel <run-id> [--wait [--timeout <duration>]]
 umio graph recover <module> <run-id> <node-id> (--retry | --fail [msg] | --complete <json> | --complete-file <f>)
+umio graph approvals [<run-id>]
+umio graph approve|reject <run-id> <node-id> [--comment <text>] [--by <name>]
+umio graph migrate            create the PostgreSQL tables
 ```
 
-Global options: `--config <file>` (else `UMIO_CONFIG`, else `umio.config.json` in the working directory or a parent), `--model <alias>`, `--tools <a,b>` (toolsets; default all configured), `--yes` (approve every tool), `--store <dir>` (graph checkpoints; default `.umio/runs` next to the config), `--json`, `--quiet`, `--no-color`, `--heartbeat <duration>`, `--debug`, `-h/--help`, `-v/--version`.
+Global options: `--config <file>` (else `UMIO_CONFIG`, else `umio.config.json` in the working directory or a parent), `--model <alias>`, `--tools <a,b>` (toolsets; default all configured), `--yes` (approve every tool), `--store <dir|postgres-url>` (graph checkpoints; default `graph.checkpoint` in the config, else `.umio/runs` next to it), `--json`, `--quiet`, `--no-color`, `--heartbeat <duration>`, `--debug`, `-h/--help`, `-v/--version`.
 
 A workflow module is an ES module whose default export is a `WorkflowDefinition` or a function `({ llm, config }) => WorkflowDefinition` (may be async). It must import `umio` from the same installation as the CLI (instances are shared through one ESM build).
 
-Exit codes: 0 success; 1 error or failed run; 2 usage error; 3 run needs recovery; 130 cancelled.
+Exit codes: 0 success; 1 error or failed run; 2 usage error; 3 run needs recovery; 4 run paused for an approval; 130 cancelled.
 
 ## Main screens
 
@@ -106,3 +109,11 @@ Session persistence, multi-line editing, a full-screen layout, MCP, and a config
 ## Cross-process cancel (added after the MVP)
 
 `graph cancel` from another process writes `control/<run>.cancel.json` (temp file, fsync, rename) next to the run. The requester never writes run files or leases. The store holder reads the file inside `isCancelRequested`, which the executor polls every `cancelPollIntervalMs` (2 s) on its own timer and before each attempt starts, and records the request in the run under its own mutex, so the run keeps a single writer and the cancel goes through the executor's fenced path. The request carries the run's `instance` (random per `create()`), so it cannot match a later run with the same ID. Requests for terminal, missing or other-instance runs are discarded on read and swept by `open()`; temp files older than 60 s from crashed requesters are swept too. The CLI reports `recorded` / `already-requested` / `requested` (not confirmed) apart from `cancelled` and, with `--wait`, the final status it observed.
+
+## Approvals and the PostgreSQL store (added later)
+
+- `graph approvals` lists waiting requests (title, description, time, request ID, `onReject`, the run input and the context outputs, six lines each unless `--verbose`) with the two commands to decide. `run`, `resume` and `status` show the same block and, for a paused run, the `resume` command.
+- `graph approve|reject` never applies a decision: it records it (store free or Postgres: the executor's `approve()`/`reject()`; file store held by another process: an exclusive decision file). The reply says "recorded — not yet applied" and who applies it: the driving process within ~2 s, or `graph resume` for a paused run. A different decision already recorded exits 1 and shows the one that stands. `--by` defaults to the OS user name. This is distinct from chat's tool confirmation.
+- Loop iterations print as `↻ <loop> iteration <n>`; body nodes appear in node tables under `<loop>#<n>/<node>`; loop nodes show their iteration count. Results list only top-level nodes.
+- `graph.checkpoint: { type: "postgres", connectionString, schema?, tablePrefix? }` or `--store postgres://…` selects `PostgresCheckpointStore`. `pg` is an optional peer dependency, imported only then. `graph migrate` creates the tables; a missing table is explained with that hint, and connection strings are shown without passwords. With Postgres no command needs control files or fails with a lock error.
+

@@ -24,6 +24,8 @@ export interface Symbols {
   readonly running: string;
   readonly pending: string;
   readonly retry: string;
+  /** Waiting for a person (approval). */
+  readonly waiting: string;
   readonly spinner: readonly string[];
 }
 
@@ -38,6 +40,7 @@ const UNICODE: Symbols = {
   running: "▸",
   pending: "·",
   retry: "↻",
+  waiting: "‖",
   spinner: ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
 };
 
@@ -52,6 +55,7 @@ const ASCII: Symbols = {
   running: ">",
   pending: ".",
   retry: "~",
+  waiting: "=",
   spinner: ["|", "/", "-", "\\"],
 };
 

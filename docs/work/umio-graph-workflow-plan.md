@@ -18,6 +18,7 @@
 | P4: Resume, uncertainty, explicit recovery, file store | Done; `resume()` (§5 steps 1–7), W6 (`recoverOrphans`), W7 on the resume and `recoverNode` paths (`finalizeCancel`), W8 (`applyRecovery`) and `recoverNode()`, `recovery: "retry"` within the budget, identity checks, and an experimental `FileCheckpointStore` (in-process mutex, fsync + rename, PID guard) passing the contract suite. A resumed run with a failed node finishes `failed` without new starts. Deviations: `LeaseUnavailableError` carries `leaseTtlMs` rather than `expiresAt`, because `acquireLease` does not report the holder's expiry; invalid recovery actions reject with a new `RecoveryNotApplicableError`, and the file guard with `CheckpointStoreLockedError`. Tests in `test/graph-resume.test.ts` (crash simulations after W1, after a side effect, after W2, after W3) and `test/checkpoint-file.test.ts`, mutation-checked. Verified live on local Ollama: a SIGKILLed process, `LeaseUnavailableError` before expiry, then `needs-recovery`, `recoverNode` retry and a completed resume, with the finished node not re-run. |
 | P5: Timeouts, retry, cancellation, observer | Done; node and inactivity timeouts on per-attempt timers, `retry.ts` (full jitter; retryable = `GraphNodeError.retryable`, `LLMError.retryable`, `timeout`), W3 retries with a checkpointed `retryAt` that the scheduler waits for (also after `resume()`), the D10 flow (`cancel()` with every `CancelAck` outcome, `GraphRunOptions.signal`, a control-record read before every attempt start, `cancelGraceMs`, abandonment to `uncertain` for timeout, cancel and failure, W5′ `needs-recovery`), the D6 observer queue with drain after the terminal write and lease release, the D12 configuration checks, and the provider-timeout warning from `fromConfig` and `agentNode`. Deviations: `onNodeEvent` is replaced by `GraphRunOptions.observer` (`node-event`); a result arriving after its timeout fired is discarded as a `timeout` failure; `cancel()` on a run this executor drives returns `requested` (the run then ends through the normal flow); the warning compares against the executor's node timeout in `fromConfig` and the 3 h default in `agentNode`, and is a Node process warning (`UMIO_PROVIDER_TIMEOUT_BELOW_NODE_TIMEOUT`, once per message). Tests in `test/graph-retry.test.ts`, `test/graph-timeouts.test.ts`, `test/graph-cancel.test.ts`, `test/graph-observer.test.ts` and `test/graph-long-run.test.ts` (the §10 simulations 1–6), mutation-checked (25 mutations). Also fixed in both provider adapters: the SDKs end a stream quietly when its signal aborts, which turned a cancelled streaming agent node into an empty `completed` result; `stream()` now throws the abort error. Verified live on local Ollama: a streaming node cancelled through a second executor's `cancel()` ends `cancelled`, a 15 s node timeout fails the node with `timeout`, and `examples/graph.ts` completes with the observer. |
 | Review fixes (after P5) | Done. (1) A cancel request arriving while W1 is written (local `cancel()`, run signal, or control record) is rechecked after W1 and before the handler starts; the handler never runs and W4 records the node `cancelled` (attempt counted), then W5 `cancelled`. (2) An output that fails `checkOutput` (`output-too-large`, `output-not-json`) is W2′: the node becomes `uncertain` with `uncertainReason: "invalid-output"` and the check error, never retried automatically, and the run parks (W5′) so `recoverNode()` can `complete` it with an `ArtifactRef` (the recovery clears the error), `retry` it or `fail` it. This changes the P2 acceptance "oversized or non-JSON output → non-retryable failure" to "→ non-retryable, recoverable"; the sequential `Workflow` still throws the check's message. (3) README: the node timeout covers an agent node's whole run; per-node `timeoutMs` or `null` for multi-turn agents. (4) `recoverNode()` releases its lease in `finally` on every path (release errors swallowed as elsewhere). Regression tests in `test/graph-cancel.test.ts` (W1 held open by the store), `test/graph-resume.test.ts` and `test/agents.test.ts`, each shown to fail without its fix. |
+| Planned features: approval, loops, PostgreSQL store | Done. See §14. Approval nodes (W9 request, W10 decision, W11 pause) with first-wins decisions kept by the store (`recordDecision`/`loadDecisions`, optional on `CheckpointStore`) and applied only by the lease holder; `paused` run status and `waiting` node status. Loop nodes (W12 start, W13 advance) expanded per iteration as `<loop>#<n>/<node>`. `PostgresCheckpointStore` over a `query()` interface, single-statement fenced writes, database clock, one token sequence, `migrate()`. Checkpoint `schemaVersion` 2 for definitions with approval or loop nodes only. CLI: `graph approvals|approve|reject|migrate`, exit code 4, `graph.checkpoint`. Tests: `test/graph-approval.test.ts`, `test/graph-loop.test.ts`, `test/checkpoint-postgres.test.ts` (contract suite on PGlite), `test/checkpoint-postgres-server.test.ts` (real server: client races, fencing, three multi-process scenarios), CLI tests in `test/cli-app.test.ts` and `test/cli-cross-process.test.ts`. |
 
 ### Changes in revision 4
 
@@ -74,13 +75,13 @@ Findings from reading the code at `a216ef9`. F10 and F11 are new in this revisio
   - `MemoryCheckpointStore` (reference implementation; atomic by JavaScript's run-to-completion);
   - `FileCheckpointStore`, **experimental and single-process only** (fenced CAS through an in-process mutex, restart durability through atomic temp + rename, and a best-effort PID directory guard that is not a correctness mechanism);
   - a **shared contract test suite** that any store must pass.
-- **Not shipped:** a reference database adapter. One may be added later, once its CAS, lease ownership and fencing behavior pass the contract suite under real concurrency. Adapter authors get the semantics in §3 and the suite in `test/`.
+- **Shipped later (§14):** `PostgresCheckpointStore`, which passes the contract suite on PGlite and on a real server, plus concurrency tests with several clients and processes.
 
 ### D3: Run statuses
 
 `RunStatus` = `running`, `needs-recovery`, `completed`, `failed`, `cancelled`.
 
-- `paused` and `pending` are omitted because no operation produces them.
+- `pending` is omitted because no operation produces it. `paused` was added with approvals (§14, schema version 2).
 - `needs-recovery` is included because crash recovery produces it (D13).
 - Adding statuses later requires a `schemaVersion` bump. `RunStatus` is documented as extensible.
 
@@ -734,3 +735,37 @@ None. D1–D15 are settled. Formerly open:
 - local provider defaults: adopted, with local classification (D15);
 - `maxConcurrentRequests`: added (D15);
 - `.gitignore`: `docs/` is no longer ignored (F9).
+
+## 14. Approval, loops and the PostgreSQL store (after P5)
+
+These were the README's **Planned** items. P6 (`retryFailedRun()` and the rest of the deferred list) is still open.
+
+### D16: Approval nodes
+
+- A node with `approval: { title, description?, onReject? }` has no handler. When it becomes ready, **W9** records `NodeRun.approval` (random `requestId`, title, description, the keys of its input nodes as context, `onReject`) and the node becomes `waiting`.
+- Other work continues. When nothing runs, nothing is ready and no retry is scheduled, but a node waits, the owner reads decisions once more and otherwise writes **W11** (`paused`), stops its timers, releases the lease and resolves. There is no approval timeout.
+- **Decisions** are a control record, like cancel requests: `CheckpointStore.recordDecision(runId, decision)` is an atomic insert-if-absent per `requestId` (first wins; the loser gets the winner), `loadDecisions(runId)` reads them. Nobody but the lease holder turns a decision into a run change.
+- **W10** applies a decision to its `waiting` node in one write: approval, or rejection with `onReject: "continue"`, completes the node with `ApprovalOutput` and decides its edges as W2; rejection with `onReject: "fail"` (default) fails the node with `approval-rejected`, and the run fails. A `paused` run becomes `running` in the same write. Because the node leaves `waiting` in that write, a decision is applied at most once, whoever retries.
+- The owner reads decisions on the cancel-poll timer while any node waits (so within `cancelPollIntervalMs`), after a local `approve()`, and at every drive start. `resume()` of a paused run without a decision writes nothing and resolves `paused` again.
+- `onReject: "continue"` requires a `when` on every outgoing edge, so a rejection never passes through by default.
+- Terminal writes close open nodes: waiting approvals become `cancelled` (W5, W7).
+- Known race: a decision recorded after the owner's last read and before W11 leaves the run paused with a decision; the next `resume()` applies it.
+
+### D17: Loop nodes
+
+- `loop: { body: { nodes, edges, entry }, until, maxIterations, onExhausted? }`. `until` names a registered predicate, `maxIterations` is required (1–10 000). Loops cannot nest; body edges stay in the body; plain cycles remain invalid.
+- The scheduler works on an **expanded graph** (`structure.ts`): each started iteration's body nodes appear as `<loop>#<n>/<bodyId>`, so every execution has its own record, attempts, edge decisions and `idempotencyKey`, and the DAG rules apply unchanged inside an iteration. A running loop node carries `loop: { iteration, decisions }` and is never an orphan (W6/W7 skip it).
+- **W12** starts iteration 1 (the loop node `running`, body nodes pending). When every body node of the current iteration is completed or skipped and its decision is not recorded, the owner evaluates `until` on the iteration output (exit nodes' outputs by body ID). **W13** records the result together with the next iteration's nodes, or completes the loop node (`{ iterations, exhausted, outputs }`, checked against its `maxOutputBytes`; too large → W2′ `uncertain`), or fails it (`loop-exhausted`, `predicate-error`). An iteration that finished before a crash is decided on resume from recorded outputs.
+- A failing body node fails the run; the loop node is closed `failed` (`loop-body-failed`) at the terminal write, or `cancelled` on cancel. `recoverNode` accepts body keys; `retry` of a loop node is refused.
+
+### D18: PostgreSQL store
+
+- One table of runs (record as `json`, plus status, revision, lease owner/token/expiry, cancel flag, instance), one of decisions (primary key run + request, cascade delete), one sequence for tokens, and a migrations table. `migrate()` runs one idempotent script under an advisory lock.
+- Every operation is one statement, so a pool is safe. CAS is `UPDATE … WHERE lease_token = $t AND lease_owner = $o AND lease_expires_at > now AND revision = $r`; on zero rows a second read classifies the failure (it cannot change what was written). Expiry uses the database clock unless a test injects `now`.
+- Cross-process cancel is the `cancel_requested` flag; decisions are `INSERT … ON CONFLICT DO NOTHING`.
+
+### D19: Checkpoint schema version 2
+
+- Runs whose definition has only task nodes are still written as `schemaVersion: 1`. Definitions with approval or loop nodes write version 2 (new statuses and fields). This version reads both; earlier versions reject version 2 with `CheckpointSchemaError`. Records are never migrated in place; identity pins a run to its definition, so a version-1 run never gains version-2 content.
+- `NodeSpec.handler` became optional (approval and loop nodes have none): a type-level change for code that reads it.
+

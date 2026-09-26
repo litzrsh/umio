@@ -2,7 +2,7 @@
  * Pure formatting: values in, lines of text out, for a given width and style.
  * Nothing here writes to a stream.
  */
-import type { NodeRun, WorkflowRun } from "../graph/types.js";
+import type { ApprovalDecision, NodeRun, WorkflowRun } from "../graph/types.js";
 import type { ToolCallPart, Usage } from "../llm/types.js";
 import type { ToolExecution } from "../tools/execute.js";
 import { formatDuration } from "./duration.js";
@@ -102,7 +102,11 @@ export function nodeStatusLabel(node: NodeRun, style: Style, now: number): strin
     case "uncertain":
       return style.yellow(`${symbols.uncertain} uncertain`);
     case "running":
-      return style.cyan(`${symbols.running} running`);
+      return style.cyan(
+        `${symbols.running} running${node.loop ? ` (iteration ${node.loop.iteration})` : ""}`,
+      );
+    case "waiting":
+      return style.yellow(`${symbols.waiting} waiting for approval`);
     default:
       return node.retryAt !== undefined && node.retryAt > now
         ? style.cyan(`${symbols.retry} retry in ${formatDuration(node.retryAt - now)}`)
@@ -121,6 +125,8 @@ export function runStatusLabel(status: WorkflowRun["status"], style: Style): str
       return style.yellow(`${symbols.cancelled} cancelled`);
     case "needs-recovery":
       return style.yellow(`${symbols.uncertain} needs recovery`);
+    case "paused":
+      return style.yellow(`${symbols.waiting} paused (waiting for approval)`);
     default:
       return style.cyan(`${symbols.running} running`);
   }
@@ -133,7 +139,11 @@ export function nodeTable(record: WorkflowRun, style: Style, width: number, now:
   return nodes.map((node) => {
     const id = truncate(node.nodeId, idWidth).padEnd(idWidth);
     const status = nodeStatusLabel(node, style, now);
-    const attempt = node.attempt > 0 ? ` · attempt ${node.attempt}` : "";
+    const attempt = node.loop
+      ? ` · ${node.loop.iteration} iteration${node.loop.iteration === 1 ? "" : "s"}`
+      : node.attempt > 0
+        ? ` · attempt ${node.attempt}`
+        : "";
     const end = node.finishedAt ?? (node.status === "running" ? now : undefined);
     const time =
       node.startedAt !== undefined && end !== undefined
@@ -186,6 +196,56 @@ export function recoveryBlock(
     lines.push(
       style.dim(
         `  Then continue with: umio graph resume ${quote(modulePath)} ${quote(record.runId)}`,
+      ),
+    );
+  }
+  return lines;
+}
+
+/**
+ * For each approval request waiting for a decision: what is asked, whether a
+ * decision is already recorded, and the explicit commands to decide.
+ */
+export function approvalBlock(
+  record: WorkflowRun,
+  style: Style,
+  options: { module?: string; decisions?: readonly ApprovalDecision[] } = {},
+): string[] {
+  const waiting = Object.values(record.nodes).filter((node) => node.status === "waiting");
+  if (waiting.length === 0) return [];
+  const lines = [
+    style.yellow(
+      `${style.symbols.waiting} ${waiting.length} approval${waiting.length === 1 ? "" : "s"} needed. The waiting branch continues only after a person decides.`,
+    ),
+  ];
+  for (const node of waiting) {
+    const request = node.approval;
+    if (!request) continue;
+    const decision = options.decisions?.find((item) => item.requestId === request.requestId);
+    lines.push(`  ${style.bold(node.nodeId)} · ${request.title}`);
+    if (request.description) lines.push(`    ${request.description}`);
+    lines.push(
+      style.dim(
+        `    requested ${new Date(request.requestedAt).toLocaleString()} · request ${request.requestId}${request.context.length ? ` · context: ${request.context.join(", ")}` : ""}`,
+      ),
+    );
+    if (decision) {
+      lines.push(
+        `    ${decision.approved ? style.green("approved") : style.red("rejected")}${decision.decidedBy ? ` by ${decision.decidedBy}` : ""} — recorded, not yet applied (${record.status === "paused" ? "applied when the run is resumed" : "its owner applies it within ~2 s"})`,
+      );
+      continue;
+    }
+    const target = `${quote(record.runId)} ${quote(node.nodeId)}`;
+    lines.push(
+      style.dim(`    Review: umio graph approvals ${quote(record.runId)}`),
+      style.dim(`      umio graph approve ${target} [--comment "…"]`),
+      style.dim(`      umio graph reject ${target} [--comment "…"]`),
+    );
+  }
+  if (record.status === "paused") {
+    lines.push(
+      style.dim(
+        `  After deciding, continue with: umio graph resume ${quote(options.module ?? "<module>")} ${quote(record.runId)}`,
       ),
     );
   }

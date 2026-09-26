@@ -71,6 +71,32 @@ describe("parseCommandLine", () => {
       wait: true,
       timeoutMs: 120_000,
     });
+    expect(command("graph", "approvals").command).toEqual({ kind: "graph-approvals" });
+    expect(command("graph", "approvals", "r1").command).toEqual({
+      kind: "graph-approvals",
+      runId: "r1",
+    });
+    expect(
+      command("graph", "approve", "r1", "loop#2/review", "--comment", "ok", "--by", "ana").command,
+    ).toEqual({
+      kind: "graph-decide",
+      runId: "r1",
+      target: "loop#2/review",
+      approved: true,
+      comment: "ok",
+      by: "ana",
+    });
+    expect(command("graph", "reject", "r1", "review").command).toEqual({
+      kind: "graph-decide",
+      runId: "r1",
+      target: "review",
+      approved: false,
+    });
+    expect(parseCommandLine(["graph", "approve", "r1"])).toMatchObject({
+      ok: false,
+      error: "graph approve needs <run-id> <node-id>.",
+    });
+    expect(command("graph", "migrate").command).toEqual({ kind: "graph-migrate" });
     expect(command("graph", "list", "--needs-recovery").command).toEqual({
       kind: "graph-list",
       needsRecovery: true,

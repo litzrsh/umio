@@ -56,6 +56,18 @@ export type Command =
       readonly wait: boolean;
       readonly timeoutMs: number;
     }
+  | { readonly kind: "graph-approvals"; readonly runId?: string }
+  | {
+      readonly kind: "graph-decide";
+      readonly runId: string;
+      /** The approval node's checkpoint ID (e.g. `review`, `refine#2/review`) or request ID. */
+      readonly target: string;
+      readonly approved: boolean;
+      readonly comment?: string;
+      /** Recorded as `decidedBy`; default: the OS user name. */
+      readonly by?: string;
+    }
+  | { readonly kind: "graph-migrate" }
   | {
       readonly kind: "graph-recover";
       readonly module: string;
@@ -99,6 +111,8 @@ const OPTIONS = {
   retry: { type: "boolean" },
   fail: { type: "boolean" },
   reason: { type: "string" },
+  comment: { type: "string" },
+  by: { type: "string" },
   complete: { type: "string" },
   "complete-file": { type: "string" },
   force: { type: "boolean" },
@@ -106,7 +120,18 @@ const OPTIONS = {
   "node-timeout": { type: "string" },
 } as const;
 
-const GRAPH_SUBCOMMANDS = ["run", "status", "list", "resume", "cancel", "recover"];
+export const GRAPH_SUBCOMMANDS = [
+  "run",
+  "status",
+  "list",
+  "resume",
+  "cancel",
+  "recover",
+  "approvals",
+  "approve",
+  "reject",
+  "migrate",
+];
 
 export function parseCommandLine(argv: readonly string[]): ParseResult {
   let parsed: ReturnType<typeof parseArgs<{ options: typeof OPTIONS; allowPositionals: true }>>;
@@ -246,6 +271,28 @@ function parseGraph(
       const args = need([]);
       if (failed(args)) return args;
       return ok({ kind: "graph-list", needsRecovery: values["needs-recovery"] ?? false });
+    }
+    case "approvals": {
+      if (rest.length > 1) return usage(`Unexpected argument "${rest[1]}".`);
+      return ok({ kind: "graph-approvals", ...(rest[0] !== undefined && { runId: rest[0] }) });
+    }
+    case "approve":
+    case "reject": {
+      const args = need(["run-id", "node-id"]);
+      if (failed(args)) return args;
+      return ok({
+        kind: "graph-decide",
+        runId: args[0] as string,
+        target: args[1] as string,
+        approved: sub === "approve",
+        ...(values.comment !== undefined && { comment: values.comment }),
+        ...(values.by !== undefined && { by: values.by }),
+      });
+    }
+    case "migrate": {
+      const args = need([]);
+      if (failed(args)) return args;
+      return ok({ kind: "graph-migrate" });
     }
     case "resume": {
       const args = need(["module", "run-id"]);

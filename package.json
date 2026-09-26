@@ -46,7 +46,8 @@
     "test:watch": "vitest",
     "schema": "tsx scripts/generate-schema.ts",
     "prepublishOnly": "npm run schema && npm run build",
-    "cli": "tsx src/cli/main.ts"
+    "cli": "tsx src/cli/main.ts",
+    "test:postgres": "UMIO_TEST_POSTGRES_URL=${UMIO_TEST_POSTGRES_URL:-postgres://umio:umio@localhost:55432/umio} vitest run test/checkpoint-postgres-server.test.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.128.0",
@@ -54,9 +55,20 @@
     "undici": "^7.30.0",
     "zod": "^4.6.5"
   },
+  "peerDependencies": {
+    "pg": "^8.11.0"
+  },
+  "peerDependenciesMeta": {
+    "pg": {
+      "optional": true
+    }
+  },
   "devDependencies": {
     "@biomejs/biome": "^2.5.14",
+    "@electric-sql/pglite": "^0.5.8",
     "@types/node": "^26.6.3",
+    "@types/pg": "^8.23.1",
+    "pg": "^8.23.0",
     "tsup": "^8.5.1",
     "tsx": "^4.23.15",
     "typescript": "^6.0.3",

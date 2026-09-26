@@ -1,5 +1,15 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, open, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import {
+  link,
+  mkdir,
+  open,
+  readdir,
+  readFile,
+  rename,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { UmioError } from "../../errors.js";
 import {
@@ -7,11 +17,12 @@ import {
   CheckpointStoreLockedError,
   RunNotFoundError,
 } from "../errors.js";
-import type { WorkflowRun } from "../types.js";
+import type { ApprovalDecision, WorkflowRun } from "../types.js";
 import {
   assertCheckpointSchema,
   type CasResult,
   type CheckpointStore,
+  type DecisionResult,
   type Lease,
 } from "./store.js";
 
@@ -46,6 +57,8 @@ export interface StoredRunSnapshot {
    * not picked up yet. Only reported while the run is not terminal.
    */
   readonly pendingCancelRequest?: { readonly requestedAt: number; readonly pid: number };
+  /** Approval decisions recorded for this run instance (applied or not). */
+  readonly decisions: readonly ApprovalDecision[];
 }
 
 /** What {@link FileCheckpointStore.submitCancelRequest} did. */
@@ -66,6 +79,21 @@ interface CancelRequestFile {
   readonly requestedAt: number;
   readonly pid: number;
 }
+
+/** An approval decision file: created once (never replaced), so the first decision wins. */
+interface DecisionFile {
+  readonly version: 1;
+  readonly runId: string;
+  readonly instance: string;
+  readonly decision: ApprovalDecision;
+}
+
+/** What {@link FileCheckpointStore.submitDecision} did. */
+export type DecisionReceipt =
+  | DecisionResult
+  /** No such run, or not the run instance the caller expected. */
+  | { readonly outcome: "not-found" }
+  | { readonly outcome: "already-terminal"; readonly status: WorkflowRun["status"] };
 
 const CONTROL_DIR = "control";
 /** Temporary control files older than this are leftovers of a crashed requester. */
@@ -93,6 +121,11 @@ const openDirs = new Set<string>();
  *   executor polls every `cancelPollIntervalMs`, on its own timer) and records
  *   it in the run under its own mutex, so the run is still only written by
  *   one process and the cancel goes through the executor's normal, fenced path.
+ * - Approval decisions work the same way: {@link FileCheckpointStore.submitDecision}
+ *   (or `recordDecision` in the holder) creates
+ *   `control/<run>.<request>.decision.json` exclusively (hard link of a
+ *   flushed temporary file), so the first decision per request wins across
+ *   processes; the executor reads them and applies them under its lease.
  *
  * For several processes, use a store backed by a database with real CAS and
  * run the contract suite (`test/checkpoint-contract.ts`) against it.
@@ -173,6 +206,31 @@ export class FileCheckpointStore implements CheckpointStore {
     await mkdir(join(root, CONTROL_DIR), { recursive: true });
     await atomicWrite(file, JSON.stringify(request));
     return { outcome: "recorded", instance, requestedAt };
+  }
+
+  /**
+   * Records an approval decision without opening the store, like
+   * {@link FileCheckpointStore.submitCancelRequest}: safe while another
+   * process holds the directory, never touches the run file. The first
+   * decision per request wins (`already-decided` returns it).
+   */
+  static async submitDecision(
+    dir: string,
+    runId: string,
+    decision: ApprovalDecision,
+    options: { instance?: string } = {},
+  ): Promise<DecisionReceipt> {
+    const root = resolve(dir);
+    const entry = await readEntry(join(root, fileName(runId)));
+    if (!entry) return { outcome: "not-found" };
+    const instance = instanceOf(entry);
+    if (options.instance !== undefined && options.instance !== instance) {
+      return { outcome: "not-found" };
+    }
+    if (isTerminal(entry.record.status)) {
+      return { outcome: "already-terminal", status: entry.record.status };
+    }
+    return createDecision(root, runId, instance, decision);
   }
 
   /**
@@ -306,10 +364,27 @@ export class FileCheckpointStore implements CheckpointStore {
     });
   }
 
+  recordDecision(runId: string, decision: ApprovalDecision): Promise<DecisionResult> {
+    return this.exclusive(async () => {
+      const entry = await this.require(runId);
+      return createDecision(this.dir, runId, instanceOf(entry), decision);
+    });
+  }
+
+  loadDecisions(runId: string): Promise<ApprovalDecision[]> {
+    return this.exclusive(async () => {
+      const entry = await this.read(runId);
+      return entry ? readDecisions(this.dir, runId, instanceOf(entry)) : [];
+    });
+  }
+
   delete(runId: string): Promise<void> {
     return this.exclusive(async () => {
       await rm(this.fileFor(runId), { force: true });
       await rm(controlFile(this.dir, runId), { force: true });
+      for (const file of await decisionFiles(this.dir, runId)) {
+        await rm(file.path, { force: true });
+      }
     });
   }
 
@@ -328,7 +403,9 @@ export class FileCheckpointStore implements CheckpointStore {
         if (info && this.now() - info.mtimeMs > STALE_TEMP_MS) await rm(path, { force: true });
         continue;
       }
-      const request = await readControl(path);
+      const request = name.endsWith(".decision.json")
+        ? await readDecisionFile(path)
+        : await readControl(path);
       const entry = request ? await this.read(request.runId) : undefined;
       if (
         !request ||
@@ -423,7 +500,97 @@ async function readSnapshot(root: string, name: string): Promise<StoredRunSnapsh
     ...(pending && {
       pendingCancelRequest: { requestedAt: request.requestedAt, pid: request.pid },
     }),
+    decisions: await readDecisions(root, entry.record.runId, instance),
   };
+}
+
+function decisionFile(root: string, runId: string, requestId: string): string {
+  return join(
+    root,
+    CONTROL_DIR,
+    `${encodeURIComponent(runId)}.${encodeURIComponent(requestId)}.decision.json`,
+  );
+}
+
+/**
+ * Creates a decision file unless one exists for the request: the content is
+ * written and flushed to a temporary file, then hard-linked into place, which
+ * fails if the name exists. The first decision wins, across processes.
+ */
+async function createDecision(
+  root: string,
+  runId: string,
+  instance: string,
+  decision: ApprovalDecision,
+): Promise<DecisionResult> {
+  const file = decisionFile(root, runId, decision.requestId);
+  const existing = await readDecisionFile(file);
+  if (existing?.instance === instance) {
+    return { outcome: "already-decided", decision: existing.decision };
+  }
+  await mkdir(join(root, CONTROL_DIR), { recursive: true });
+  const content: DecisionFile = { version: 1, runId, instance, decision };
+  const temp = `${file}.${randomUUID()}.tmp`;
+  const handle = await open(temp, "w");
+  try {
+    await handle.writeFile(JSON.stringify(content));
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  try {
+    await link(temp, file);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    const winner = await readDecisionFile(file);
+    if (!winner || winner.instance !== instance) throw error;
+    return { outcome: "already-decided", decision: winner.decision };
+  } finally {
+    await rm(temp, { force: true });
+  }
+  return { outcome: "recorded", decision };
+}
+
+async function readDecisionFile(file: string): Promise<DecisionFile | undefined> {
+  try {
+    const value = JSON.parse(await readFile(file, "utf8")) as Partial<DecisionFile>;
+    return value.version === 1 &&
+      typeof value.runId === "string" &&
+      typeof value.instance === "string" &&
+      typeof value.decision?.requestId === "string"
+      ? (value as DecisionFile)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Decision files that may belong to the run (their content says for sure). */
+async function decisionFiles(
+  root: string,
+  runId: string,
+): Promise<{ path: string; content?: DecisionFile }[]> {
+  const prefix = `${encodeURIComponent(runId)}.`;
+  const names = await readdir(join(root, CONTROL_DIR)).catch(() => [] as string[]);
+  const files: { path: string; content?: DecisionFile }[] = [];
+  for (const name of names) {
+    if (!name.startsWith(prefix) || !name.endsWith(".decision.json")) continue;
+    const path = join(root, CONTROL_DIR, name);
+    const content = await readDecisionFile(path);
+    if (content && content.runId !== runId) continue;
+    files.push({ path, ...(content && { content }) });
+  }
+  return files;
+}
+
+async function readDecisions(
+  root: string,
+  runId: string,
+  instance: string,
+): Promise<ApprovalDecision[]> {
+  return (await decisionFiles(root, runId))
+    .filter((file) => file.content?.instance === instance)
+    .map((file) => (file.content as DecisionFile).decision);
 }
 
 /** Runs created before instances existed are told apart by their creation time. */

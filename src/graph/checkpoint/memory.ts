@@ -1,9 +1,10 @@
 import { CheckpointConflictError, RunNotFoundError } from "../errors.js";
-import type { WorkflowRun } from "../types.js";
+import type { ApprovalDecision, WorkflowRun } from "../types.js";
 import {
   assertCheckpointSchema,
   type CasResult,
   type CheckpointStore,
+  type DecisionResult,
   type Lease,
 } from "./store.js";
 
@@ -14,6 +15,8 @@ interface Entry {
   /** The current lease, if held and not released (it may have expired). */
   lease?: { ownerId: string; token: number; expiresAt: number };
   cancelRequested: boolean;
+  /** Approval decisions by request ID. */
+  decisions: Map<string, ApprovalDecision>;
 }
 
 export interface MemoryCheckpointStoreOptions {
@@ -45,6 +48,7 @@ export class MemoryCheckpointStore implements CheckpointStore {
       token: 1,
       lease: { ownerId, token: 1, expiresAt },
       cancelRequested: false,
+      decisions: new Map(),
     });
     return { runId: run.runId, ownerId, token: 1, expiresAt };
   }
@@ -98,6 +102,18 @@ export class MemoryCheckpointStore implements CheckpointStore {
 
   async isCancelRequested(runId: string): Promise<boolean> {
     return this.entries.get(runId)?.cancelRequested ?? false;
+  }
+
+  async recordDecision(runId: string, decision: ApprovalDecision): Promise<DecisionResult> {
+    const { decisions } = this.require(runId);
+    const existing = decisions.get(decision.requestId);
+    if (existing) return { outcome: "already-decided", decision: structuredClone(existing) };
+    decisions.set(decision.requestId, structuredClone(decision));
+    return { outcome: "recorded", decision: structuredClone(decision) };
+  }
+
+  async loadDecisions(runId: string): Promise<ApprovalDecision[]> {
+    return structuredClone([...(this.entries.get(runId)?.decisions.values() ?? [])]);
   }
 
   async delete(runId: string): Promise<void> {

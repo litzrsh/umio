@@ -15,7 +15,8 @@ Options
   -m, --model <alias>     model alias (default: the config's defaultModel)
       --tools <a,b>       toolsets to offer (default: all configured; "none" for no tools)
   -y, --yes               run tools that may change things without asking
-      --store <dir>       graph checkpoint directory (default: .umio/runs next to the config)
+      --store <dir|url>   graph checkpoint store: a directory, or a postgres:// URL
+                          (default: graph.checkpoint in the config, else .umio/runs next to it)
       --json              machine-readable output (ask, doctor, config, models, tools, graph)
   -q, --quiet             no progress, heartbeats or tool lines; results and errors only
       --no-color          plain output (also: NO_COLOR=1)
@@ -25,7 +26,8 @@ Options
   -h, --help              help (umio help <command>)
   -v, --version           version
 
-Exit codes: 0 ok · 1 error or failed run · 2 usage · 3 run needs recovery · 130 cancelled
+Exit codes: 0 ok · 1 error or failed run · 2 usage · 3 run needs recovery
+            4 run paused for an approval · 130 cancelled
 `;
 
 export const TOPICS: Record<string, string> = {
@@ -72,24 +74,45 @@ never called. Exit code 1 if any check fails.
   umio graph list [--needs-recovery]
   umio graph resume <module> <run-id>
   umio graph cancel <run-id> [--wait [--timeout <duration>]]
+  umio graph approvals [<run-id>]
+  umio graph approve <run-id> <node-id> [--comment <text>] [--by <name>]
+  umio graph reject <run-id> <node-id> [--comment <text>] [--by <name>]
   umio graph recover <module> <run-id> <node-id> --retry
   umio graph recover <module> <run-id> <node-id> --complete <json> | --complete-file <file>
   umio graph recover <module> <run-id> <node-id> --fail [--reason <text>]
+  umio graph migrate            create the PostgreSQL tables (once)
 
 <module> is an ES module whose default export is a WorkflowDefinition or a
-function ({ llm, config }) => WorkflowDefinition. Runs are checkpointed in
---store (default .umio/runs next to the config); that store is single-process.
-While another umio process holds it, status and list still work, cancel sends
-a request (below), and resume and recover fail at once with a lock error.
+function ({ llm, config }) => WorkflowDefinition.
 
-cancel works from any terminal. If another umio process is driving the run, it
-writes a cancel request file; that process picks it up within ~2 s, even during
-a silent model call, and stops the run through its normal cancel path. The
-reply says "recorded — not yet confirmed". --wait (up to --timeout, default
-30s) waits until the run is seen to end: "Confirmed: … cancelled", or that it
-ended otherwise first (exit 1). If the owner died, --wait finalizes the cancel
-itself once its lease expires. Exit 0: recorded or confirmed; 1: not found,
-not confirmed in time, or the run ended some other way.
+Stores. By default runs are checkpointed in .umio/runs next to the config (or
+--store <dir>); that file store is single-process. While another umio process
+holds it, status, list and approvals still work, cancel/approve/reject send a
+request file that process applies (below), and resume and recover fail at once
+with a lock error. With "graph": { "checkpoint": { "type": "postgres",
+"connectionString": "..." } } in the config (or --store postgres://...), runs
+live in PostgreSQL: any number of processes and machines can share them, and
+every command works while another process drives a run. It needs the \`pg\`
+package (npm install pg) and \`umio graph migrate\` once.
+
+Approvals. An approval node pauses its branch until a person decides. When
+nothing else can run, the run is "paused" (exit 4) and no process owns it.
+\`graph approvals\` shows each waiting request with the run input and the
+outputs it is about; \`approve\`/\`reject\` record a decision (the first one
+per request wins; --by defaults to your user name). A decision is "recorded —
+not yet applied": the process driving the run applies it within ~2 s, and a
+paused run applies it when you \`graph resume\` it. A rejection fails the run,
+unless the node says onReject "continue" (the workflow then routes it).
+Approvals are separate from chat's y/n tool confirmations.
+
+Loops. A loop node repeats its body until its condition holds, at most
+maxIterations times. Each iteration's nodes appear as <loop>#<n>/<node>, e.g.
+refine#2/draft; use that ID with recover.
+
+cancel works from any terminal and says "recorded — not yet confirmed" until
+the run is seen to end. --wait (up to --timeout, default 30s) waits for it:
+"Confirmed: … cancelled", or that it ended otherwise first (exit 1). If the
+owner died, --wait finalizes the cancel itself once its lease expires.
 
 Ctrl+C during run/resume cancels the run (recorded; nodes get a grace period).
 A second Ctrl+C exits at once and leaves the run as it is: \`graph status\`

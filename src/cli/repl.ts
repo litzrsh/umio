@@ -222,7 +222,7 @@ export async function startRepl(context: Context): Promise<number> {
       terminal.forceNote(`${style.red("error:")} ${parsed.error}`);
       terminal.note(
         style.dim(
-          "hint: /graph run <module> · status <run-id> · list · resume <module> <run-id> · cancel <run-id> · recover …",
+          "hint: /graph run <module> · status <run-id> · list · resume <module> <run-id> · cancel <run-id> · approvals · approve|reject <run-id> <node-id> · recover …",
         ),
       );
       return;

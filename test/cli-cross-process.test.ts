@@ -212,4 +212,59 @@ describe("umio graph cancel from another process", () => {
     owner.child.kill("SIGINT"); // the owner's own Ctrl+C still cancels
     expect(await owner.exit).toBe(130);
   }, 60_000);
+
+  it("approve from another terminal while the owner holds the store: a decision file the owner applies", async () => {
+    const dir = await project();
+    await writeFile(
+      join(dir, "gate.mjs"),
+      `export default {
+        graph: {
+          id: "gate", version: "1", entry: ["gate", "slow"],
+          nodes: [
+            { id: "gate", approval: { title: "Go?" } },
+            { id: "after", handler: "after" },
+            { id: "slow", handler: "slow" },
+          ],
+          edges: [{ from: "gate", to: "after" }],
+        },
+        handlers: {
+          after: async () => "after ran",
+          slow: (context) => new Promise((_, reject) =>
+            context.signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true })),
+        },
+        predicates: {},
+      };`,
+    );
+    const owner = umio(dir, ["graph", "run", "gate.mjs", "--run-id", "g1"]);
+    await until(
+      () => owner.stderr().includes("gate waiting for approval"),
+      "the request",
+      20_000,
+      owner,
+    );
+
+    const listed = umio(dir, ["graph", "approvals", "g1", "--json"]);
+    await listed.exit;
+    expect(JSON.parse(listed.stdout())).toMatchObject([{ nodeId: "gate", runStatus: "running" }]);
+
+    const approve = umio(dir, ["graph", "approve", "g1", "gate", "--by", "ana"]);
+    expect(await approve.exit).toBe(0);
+    expect(approve.stdout()).toMatch(/Approval recorded for run g1, gate — not yet applied/);
+    expect(approve.stdout()).toMatch(/The umio process driving the run applies it within ~2 s/);
+    await until(
+      () => owner.stderr().includes("after completed"),
+      "the owner to apply it",
+      20_000,
+      owner,
+    );
+
+    owner.child.kill("SIGINT");
+    expect(await owner.exit).toBe(130);
+    const persisted = await FileCheckpointStore.snapshot(join(dir, ".umio", "runs"), "g1");
+    expect(persisted?.record.nodes.gate).toMatchObject({
+      status: "completed",
+      output: { approved: true, decidedBy: "ana" },
+    });
+    expect(persisted?.decisions).toHaveLength(1);
+  }, 60_000);
 });

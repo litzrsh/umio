@@ -85,6 +85,7 @@ describe("FileCheckpointStore", () => {
       cancelRequested: true,
       lease: { ownerId: "owner-a", expiresAt: 31_000 },
       instance: expect.any(String),
+      decisions: [],
     });
     const all = await FileCheckpointStore.snapshots(dir);
     expect(all.map((run) => [run.record.runId, run.lease?.ownerId])).toEqual([
@@ -288,6 +289,91 @@ describe("cancel requests from another process", () => {
     await utimes(oldTemp, hourAgo, hourAgo);
     await openStore(dir);
     expect(await controlFiles(dir)).toEqual(["b.cancel.json.2.tmp"]); // may still be renamed by a live requester
+  });
+});
+
+describe("approval decisions from another process", () => {
+  const decision = (requestId: string, approved: boolean) => ({
+    requestId,
+    nodeId: "review",
+    approved,
+    decidedAt: 5,
+  });
+
+  it("are created beside the run, never into it; the first per request wins across writers", async () => {
+    const dir = await tempDir();
+    const store = await openStore(dir, () => 1_000);
+    await store.create(record, "owner-a", 30_000);
+    const before = await readFile(
+      join(dir, `${encodeURIComponent(record.runId)}.run.json`),
+      "utf8",
+    );
+    // Ten concurrent writers (the holder and outsiders), conflicting decisions.
+    const results = await Promise.all(
+      Array.from({ length: 10 }, (_, index) =>
+        index % 2 === 0
+          ? store.recordDecision(record.runId, decision("req", index % 4 === 0))
+          : FileCheckpointStore.submitDecision(dir, record.runId, decision("req", false)),
+      ),
+    );
+    const winners = results.filter((result) => result.outcome === "recorded");
+    expect(winners).toHaveLength(1);
+    const winner = (winners[0] as { decision: unknown }).decision;
+    for (const result of results) expect(result).toMatchObject({ decision: winner });
+    await expect(store.loadDecisions(record.runId)).resolves.toEqual([winner]);
+    expect(await readFile(join(dir, `${encodeURIComponent(record.runId)}.run.json`), "utf8")).toBe(
+      before,
+    );
+    expect((await readdir(join(dir, "control"))).filter((name) => name.endsWith(".tmp"))).toEqual(
+      [],
+    );
+  });
+
+  it("are refused for terminal and unknown runs and other instances; stale ones never reach a reused ID", async () => {
+    const dir = await tempDir();
+    const store = await openStore(dir, () => 1_000);
+    await store.create(record, "owner-a", 30_000);
+    const snapshot = await FileCheckpointStore.snapshot(dir, record.runId);
+    await expect(
+      FileCheckpointStore.submitDecision(dir, record.runId, decision("q", true), {
+        instance: "someone-else",
+      }),
+    ).resolves.toEqual({ outcome: "not-found" });
+    await expect(
+      FileCheckpointStore.submitDecision(dir, "missing", decision("q", true)),
+    ).resolves.toEqual({ outcome: "not-found" });
+    await FileCheckpointStore.submitDecision(dir, record.runId, decision("q", true), {
+      instance: snapshot?.instance,
+    });
+    // The run is deleted and its ID reused: the old decision is gone and never applies.
+    await store.delete(record.runId);
+    await store.create(record, "owner-b", 30_000);
+    await expect(store.loadDecisions(record.runId)).resolves.toEqual([]);
+    // A decision naming the old instance is refused for the new run.
+    await expect(
+      FileCheckpointStore.submitDecision(dir, record.runId, decision("q", true), {
+        instance: snapshot?.instance,
+      }),
+    ).resolves.toEqual({ outcome: "not-found" });
+  });
+
+  it("open() sweeps decisions of runs that are gone or finished, and snapshots report the rest", async () => {
+    const dir = await tempDir();
+    let time = 1_000;
+    const first = await openStore(dir, () => time);
+    const lease = await first.create(record, "owner-a", 30_000);
+    await first.create({ ...record, runId: "live" }, "owner-a", 30_000);
+    await first.recordDecision(record.runId, decision("a", true));
+    await first.recordDecision("live", decision("b", false));
+    await first.compareAndSwap({ ...record, status: "completed", revision: 1 }, 0, lease);
+    await first.close();
+    time += 1;
+    await openStore(dir, () => time);
+    const names = await readdir(join(dir, "control"));
+    expect(names).toHaveLength(1);
+    expect((await FileCheckpointStore.snapshot(dir, "live"))?.decisions).toEqual([
+      decision("b", false),
+    ]);
   });
 });
 

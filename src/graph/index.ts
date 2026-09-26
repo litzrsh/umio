@@ -7,6 +7,7 @@ export {
 } from "./agent-node.js";
 export {
   type CancelRequestReceipt,
+  type DecisionReceipt,
   FileCheckpointStore,
   type FileCheckpointStoreOptions,
   type StoredRunSnapshot,
@@ -16,11 +17,21 @@ export {
   type MemoryCheckpointStoreOptions,
 } from "./checkpoint/memory.js";
 export {
+  POSTGRES_STORE_SCHEMA_VERSION,
+  PostgresCheckpointStore,
+  type PostgresCheckpointStoreOptions,
+  type PostgresRunSnapshot,
+  postgresSchemaSql,
+  type SqlClient,
+} from "./checkpoint/postgres.js";
+export {
   assertCheckpointSchema,
   type CasResult,
   CHECKPOINT_SCHEMA_VERSION,
   type CheckpointStore,
+  type DecisionResult,
   type Lease,
+  SUPPORTED_CHECKPOINT_SCHEMA_VERSIONS,
 } from "./checkpoint/store.js";
 export {
   CheckpointConflictError,
@@ -45,17 +56,26 @@ export {
   DEFAULT_NODE_TIMEOUT_MS,
   DEFAULT_OBSERVER_DRAIN_TIMEOUT_MS,
   type GraphRunOptions,
+  pendingApprovalsOf,
   WorkflowExecutor,
   type WorkflowExecutorOptions,
 } from "./executor.js";
 export { definitionHash } from "./identity.js";
 export { type ArtifactRef, collectArtifactRefs, isArtifactRef } from "./output.js";
+export { iterationKey } from "./structure.js";
 export type {
+  ApprovalAck,
+  ApprovalDecision,
+  ApprovalOutput,
+  ApprovalRequest,
+  ApprovalSpec,
   CancelAck,
   EdgePredicate,
   EdgeSpec,
   GraphRunEvent,
   JsonValue,
+  LoopOutput,
+  LoopSpec,
   NodeContext,
   NodeError,
   NodeEvent,
@@ -64,6 +84,7 @@ export type {
   NodeRun,
   NodeSpec,
   NodeStatus,
+  PendingApproval,
   RecoveryAction,
   RetryPolicy,
   RunObserver,
@@ -72,5 +93,5 @@ export type {
   WorkflowGraph,
   WorkflowRun,
 } from "./types.js";
-export { isJsonValue, validateDefinition } from "./validate.js";
+export { isJsonValue, MAX_LOOP_ITERATIONS, validateDefinition } from "./validate.js";
 export { shortProviderTimeouts } from "./warnings.js";

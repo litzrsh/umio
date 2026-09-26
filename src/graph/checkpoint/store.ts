@@ -1,5 +1,5 @@
 import { CheckpointSchemaError } from "../errors.js";
-import type { WorkflowRun } from "../types.js";
+import type { ApprovalDecision, WorkflowRun } from "../types.js";
 
 /**
  * The right to write a run record. `token` is a fencing token: every
@@ -16,6 +16,12 @@ export interface Lease {
 
 export type CasResult = "ok" | "revision-conflict" | "lease-lost";
 
+/** What `recordDecision` did: the first decision per request wins, and is returned either way. */
+export interface DecisionResult {
+  readonly outcome: "recorded" | "already-decided";
+  readonly decision: ApprovalDecision;
+}
+
 /**
  * Durable storage for run records, leases and cancel requests. Implementations
  * must pass the shared contract suite (`test/checkpoint-contract.ts`).
@@ -27,9 +33,14 @@ export type CasResult = "ok" | "revision-conflict" | "lease-lost";
  *    otherwise `"lease-lost"`;
  * 2. the stored revision equals `expectedRevision`; otherwise `"revision-conflict"`.
  *
- * Cancel requests live in a separate control record that anyone may write
- * without a lease. Records are copied in and out: callers never share objects
- * with the store.
+ * Cancel requests and approval decisions live in separate control records
+ * that anyone may write without a lease; only the lease holder turns them into
+ * run-record changes. Records are copied in and out: callers never share
+ * objects with the store.
+ *
+ * `recordDecision` and `loadDecisions` are optional so stores written before
+ * approvals existed keep working for workflows without approval nodes; the
+ * executor rejects approval workflows on a store without them.
  */
 export interface CheckpointStore {
   /** Stores a new run and issues its first lease. Rejects if the run ID exists (`CheckpointConflictError`). */
@@ -50,16 +61,27 @@ export interface CheckpointStore {
   /** Records a cancel request for the lease holder to act on. Rejects with `RunNotFoundError`. */
   requestCancel(runId: string): Promise<void>;
   isCancelRequested(runId: string): Promise<boolean>;
-  /** Removes the run, its lease state and its control record. Never touches artifacts. */
+  /** Removes the run, its lease state and its control records. Never touches artifacts. */
   delete(runId: string): Promise<void>;
+  /**
+   * Stores a decision for `decision.requestId` unless one exists: atomic
+   * insert-if-absent, so concurrent approvers cannot both win. Needs no lease.
+   * Rejects with `RunNotFoundError` if the run does not exist.
+   */
+  recordDecision?(runId: string, decision: ApprovalDecision): Promise<DecisionResult>;
+  /** Every decision recorded for the run (applied or not), in any order. */
+  loadDecisions?(runId: string): Promise<ApprovalDecision[]>;
 }
 
-/** The checkpoint schema this version reads and writes. */
-export const CHECKPOINT_SCHEMA_VERSION = 1;
+/** The newest checkpoint schema this version writes (see `WorkflowRun.schemaVersion`). */
+export const CHECKPOINT_SCHEMA_VERSION = 2;
+
+/** Every checkpoint schema this version reads. */
+export const SUPPORTED_CHECKPOINT_SCHEMA_VERSIONS: readonly number[] = [1, 2];
 
 /** Throws `CheckpointSchemaError` unless the record has a supported `schemaVersion`. For store adapters. */
 export function assertCheckpointSchema(run: WorkflowRun): void {
-  if (run.schemaVersion !== CHECKPOINT_SCHEMA_VERSION) {
+  if (!SUPPORTED_CHECKPOINT_SCHEMA_VERSIONS.includes(run.schemaVersion)) {
     throw new CheckpointSchemaError(run.runId, run.schemaVersion);
   }
 }

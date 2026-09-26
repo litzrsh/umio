@@ -144,6 +144,41 @@ export const GraphConfigSchema = z
     cancelGraceMs: z.number().int().nonnegative().optional(),
     /** How long a finished run waits for observers to receive queued events. Default 5000. */
     observerDrainTimeoutMs: z.number().int().nonnegative().optional(),
+    /**
+     * Where the `umio` CLI keeps graph runs. Default: a file store in
+     * `.umio/runs` next to the config (one process at a time). `postgres`
+     * lets several processes and machines share runs; it needs the `pg`
+     * package and tables created with `umio graph migrate`. Library code
+     * passes a store to the executor instead.
+     */
+    checkpoint: z
+      .discriminatedUnion("type", [
+        z
+          .object({
+            type: z.literal("file"),
+            /** Directory, relative to the config file. Default ".umio/runs". */
+            dir: z.string().min(1).optional(),
+          })
+          .strict(),
+        z
+          .object({
+            type: z.literal("postgres"),
+            /** e.g. "${DATABASE_URL}" or "postgres://user:pass@host:5432/db". */
+            connectionString: z.string().min(1),
+            /** Schema for the tables. Default: the connection's search_path. */
+            schema: z
+              .string()
+              .regex(/^[a-z_][a-z0-9_]*$/)
+              .optional(),
+            /** Prefix of the table names. Default "umio_". */
+            tablePrefix: z
+              .string()
+              .regex(/^[a-z_][a-z0-9_]*$/)
+              .optional(),
+          })
+          .strict(),
+      ])
+      .optional(),
   })
   .strict();
 

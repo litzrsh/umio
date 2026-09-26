@@ -14,6 +14,8 @@ export default defineConfig([
     dts: { entry: "src/index.ts", ...dtsOptions },
     sourcemap: true,
     target: "node20",
+    // Optional peer dependency, loaded only for a PostgreSQL store.
+    external: ["pg"],
   },
   {
     entry: { index: "src/index.ts" },
@@ -21,5 +23,6 @@ export default defineConfig([
     dts: { entry: "src/index.ts", ...dtsOptions },
     sourcemap: true,
     target: "node20",
+    external: ["pg"],
   },
 ]);

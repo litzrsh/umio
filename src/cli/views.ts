@@ -2,16 +2,24 @@
  * Terminal implementations of the adapters' views: they turn chat and graph
  * events into lines on a `Terminal` and phases on an `Activity`.
  */
-import type { StoredRunSnapshot } from "../graph/checkpoint/file.js";
-import type { GraphRunEvent, WorkflowDefinition, WorkflowRun } from "../graph/types.js";
+import { pendingApprovalsOf } from "../graph/executor.js";
+import type {
+  ApprovalDecision,
+  GraphRunEvent,
+  PendingApproval,
+  WorkflowDefinition,
+  WorkflowRun,
+} from "../graph/types.js";
 import type { GenerateResult, ToolCallPart } from "../llm/types.js";
 import type { ToolExecution } from "../tools/execute.js";
 import type { Activity } from "./activity.js";
 import type { ChatView } from "./chat.js";
 import { formatDuration } from "./duration.js";
 import {
+  approvalBlock,
   nodeTable,
   oneLine,
+  quote,
   recoveryBlock,
   runStatusLabel,
   toolResultLines,
@@ -20,6 +28,7 @@ import {
 } from "./format.js";
 import type { GraphRunView } from "./graph.js";
 import { cancelState, ownership, type StoreHolder } from "./graph.js";
+import type { RunView } from "./store.js";
 import type { Terminal } from "./terminal.js";
 
 export class TerminalChatView implements ChatView {
@@ -70,6 +79,8 @@ export class TerminalGraphView implements GraphRunView {
   private readonly running = new Map<string, number>();
   private readonly finished = new Set<string>();
   private total = 0;
+  /** Loop node → how many body nodes each iteration adds. */
+  private readonly loopSizes = new Map<string, number>();
   runId: string | undefined;
 
   constructor(
@@ -79,6 +90,9 @@ export class TerminalGraphView implements GraphRunView {
 
   definition(definition: WorkflowDefinition): void {
     this.total = definition.graph.nodes.length;
+    for (const node of definition.graph.nodes) {
+      if (node.loop) this.loopSizes.set(node.id, node.loop.body.nodes.length);
+    }
   }
 
   event(event: GraphRunEvent): void {
@@ -138,6 +152,26 @@ export class TerminalGraphView implements GraphRunView {
         this.terminal.note(label + style.dim(time));
         break;
       }
+      case "node-waiting":
+        this.finished.add(event.nodeId);
+        this.terminal.note(
+          style.yellow(`${symbols.waiting} ${event.nodeId} waiting for approval`) +
+            style.dim(` (umio graph approve|reject ${this.runId ?? event.runId} ${event.nodeId})`),
+        );
+        break;
+      case "run-paused":
+        this.terminal.note(
+          style.yellow(
+            `${symbols.waiting} paused: nothing else can run until ${event.nodes.join(", ")} ${event.nodes.length === 1 ? "is" : "are"} decided`,
+          ),
+        );
+        break;
+      case "loop-iteration":
+        this.total += this.loopSizes.get(event.nodeId) ?? 0;
+        this.terminal.note(
+          style.cyan(`${symbols.retry} ${event.nodeId} iteration ${event.iteration}`),
+        );
+        break;
       case "run-cancel-requested":
         this.activity.set({ kind: "cancelling" }, at);
         this.terminal.note(
@@ -160,12 +194,12 @@ export class TerminalGraphView implements GraphRunView {
   }
 }
 
-/** A run's header, node table and recovery block. */
+/** A run's header, node table, approval block and recovery block. */
 export function runReport(
   run: WorkflowRun,
   terminal: Terminal,
   now: number,
-  options: { module?: string; owner?: string } = {},
+  options: { module?: string; owner?: string; decisions?: readonly ApprovalDecision[] } = {},
 ): string[] {
   const { style } = terminal;
   const lines = [
@@ -180,33 +214,96 @@ export function runReport(
     );
   }
   lines.push(...nodeTable(run, style, terminal.width, now));
+  const approvals = approvalBlock(run, style, {
+    ...(options.module && { module: options.module }),
+    ...(options.decisions && { decisions: options.decisions }),
+  });
+  if (approvals.length > 0) lines.push("", ...approvals);
   const recovery = recoveryBlock(run, style, options.module);
   if (recovery.length > 0) lines.push("", ...recovery);
   return lines;
 }
 
 export function snapshotReport(
-  snapshot: StoredRunSnapshot,
+  snapshot: RunView,
   terminal: Terminal,
   now: number,
   holder?: StoreHolder,
 ): string[] {
-  return runReport(snapshot.record, terminal, now, { owner: ownership(snapshot, now, holder) });
+  return runReport(snapshot.record, terminal, now, {
+    owner: ownership(snapshot, now, holder),
+    decisions: snapshot.decisions,
+  });
+}
+
+/** Lines for `umio graph approvals`: each waiting request with its context. */
+export function approvalLines(
+  approvals: readonly PendingApproval[],
+  terminal: Terminal,
+  verbose: boolean,
+): string[] {
+  const { style } = terminal;
+  const width = terminal.width;
+  const lines: string[] = [];
+  for (const item of approvals) {
+    const { request } = item;
+    if (lines.length > 0) lines.push("");
+    lines.push(
+      `${style.bold(item.runId)} · ${item.workflowId} · ${style.bold(item.nodeId)} · ${request.title}`,
+    );
+    if (request.description) lines.push(`  ${request.description}`);
+    lines.push(
+      style.dim(
+        `  requested ${new Date(request.requestedAt).toLocaleString()} · request ${request.requestId} · run ${item.runStatus} · on reject: ${request.onReject === "continue" ? "continue (the workflow routes it)" : "fail the run"}`,
+      ),
+    );
+    const show = (label: string, value: unknown) => {
+      const text = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+      const all = (text ?? "null").split("\n");
+      const shown = verbose ? all : all.slice(0, 6);
+      lines.push(style.dim(`  ${label}:`));
+      for (const line of shown) lines.push(`    ${truncate(line, width - 4)}`);
+      if (shown.length < all.length) {
+        lines.push(
+          style.dim(`    … ${all.length - shown.length} more lines (--verbose shows all)`),
+        );
+      }
+    };
+    show("input", item.input);
+    for (const [nodeId, output] of Object.entries(item.context)) show(nodeId, output);
+    if (item.decision) {
+      lines.push(
+        `  ${item.decision.approved ? style.green("approved") : style.red("rejected")}${item.decision.decidedBy ? ` by ${item.decision.decidedBy}` : ""} — recorded, not yet applied${item.runStatus === "paused" ? `; continue with: umio graph resume <module> ${quote(item.runId)}` : ""}`,
+      );
+    } else {
+      const target = `${quote(item.runId)} ${quote(item.nodeId)}`;
+      lines.push(
+        style.dim(`  umio graph approve ${target} [--comment "…"]`),
+        style.dim(`  umio graph reject ${target} [--comment "…"]`),
+      );
+    }
+  }
+  return lines;
 }
 
 /**
- * The outputs of completed nodes that nothing depends on (the run's results):
- * an agent node's `text`, else the JSON.
+ * The outputs of completed top-level nodes that nothing depends on (the run's
+ * results): an agent node's `text`, else the JSON. Loop body nodes are not
+ * results; their loop node's output is.
  */
 export function resultOutputs(
   run: WorkflowRun,
-  edges: readonly { from: string }[] | undefined,
+  graph: { edges: readonly { from: string }[]; nodes?: readonly { id: string }[] } | undefined,
 ): { nodeId: string; text: string }[] {
-  const sources = new Set((edges ?? []).map((edge) => edge.from));
+  const sources = new Set((graph?.edges ?? []).map((edge) => edge.from));
+  const top = graph?.nodes ? new Set(graph.nodes.map((node) => node.id)) : undefined;
   return Object.values(run.nodes)
     .filter(
       (node) =>
-        node.status === "completed" && node.output !== undefined && !sources.has(node.nodeId),
+        node.status === "completed" &&
+        node.output !== undefined &&
+        !sources.has(node.nodeId) &&
+        (!top || top.has(node.nodeId)),
     )
     .map((node) => {
       const output = node.output;
@@ -223,20 +320,21 @@ export function resultOutputs(
 
 /** A JSON-friendly view of a run for --json. */
 export function runJson(
-  snapshot: { record: WorkflowRun } & Partial<StoredRunSnapshot>,
+  snapshot: { record: WorkflowRun } & Partial<RunView>,
   now: number,
   holder?: StoreHolder,
 ) {
   const { record } = snapshot;
+  const approvals = pendingApprovalsOf(record, snapshot.decisions ?? []);
   return {
     runId: record.runId,
     workflowId: record.workflowId,
     definitionVersion: record.definitionVersion,
     status: record.status,
     ...(record.error && { error: record.error }),
-    ...(snapshot.instance !== undefined && {
-      owner: ownership(snapshot as StoredRunSnapshot, now, holder),
-      cancelRequest: cancelState(snapshot as StoredRunSnapshot),
+    ...(snapshot.decisions !== undefined && {
+      owner: ownership(snapshot as RunView, now, holder),
+      cancelRequest: cancelState(snapshot as RunView),
       ...(snapshot.pendingCancelRequest && {
         cancelRequestedAt: new Date(snapshot.pendingCancelRequest.requestedAt).toISOString(),
       }),
@@ -246,12 +344,21 @@ export function runJson(
       status: node.status,
       attempt: node.attempt,
       ...(node.uncertainReason && { uncertainReason: node.uncertainReason }),
+      ...(node.loop && { iteration: node.loop.iteration, loopDecisions: node.loop.decisions }),
       ...(node.error && { error: node.error }),
       ...(node.status === "uncertain" && { idempotencyKey: `${record.runId}:${node.nodeId}` }),
     })),
     needsRecovery: Object.values(record.nodes)
       .filter((node) => node.status === "uncertain")
       .map((node) => node.nodeId),
+    approvals: approvals.map((item) => ({
+      nodeId: item.nodeId,
+      requestId: item.request.requestId,
+      title: item.request.title,
+      ...(item.request.description !== undefined && { description: item.request.description }),
+      requestedAt: new Date(item.request.requestedAt).toISOString(),
+      ...(item.decision && { decision: item.decision }),
+    })),
     updatedAt: new Date(record.updatedAt).toISOString(),
   };
 }

@@ -8,6 +8,7 @@
  */
 import { describe, expect, it } from "vitest";
 import {
+  type ApprovalDecision,
   CheckpointConflictError,
   CheckpointSchemaError,
   type CheckpointStore,
@@ -69,10 +70,20 @@ export function checkpointStoreContract(
 
       it("rejects an unknown schema version", async () => {
         const { store } = await setup();
-        const bad = { ...record(), schemaVersion: 2 } as unknown as WorkflowRun;
+        const bad = { ...record(), schemaVersion: 99 } as unknown as WorkflowRun;
         await expect(store.create(bad, "owner-a", TTL)).rejects.toBeInstanceOf(
           CheckpointSchemaError,
         );
+      });
+
+      it("reads and writes both schema versions", async () => {
+        const { store } = await setup();
+        const v2: WorkflowRun = { ...record("run-2"), schemaVersion: 2, status: "paused" };
+        const lease = await store.create(v2, "owner-a", TTL);
+        await expect(store.load("run-2")).resolves.toEqual(v2);
+        await expect(store.compareAndSwap(revised(v2), 0, lease)).resolves.toBe("ok");
+        await store.create(record(), "owner-a", TTL);
+        await expect(store.load("run-1")).resolves.toMatchObject({ schemaVersion: 1 });
       });
 
       it("returns undefined for a missing run", async () => {
@@ -163,7 +174,7 @@ export function checkpointStoreContract(
       it("rejects an unknown schema version", async () => {
         const { store } = await setup();
         const lease = await store.create(record(), "owner-a", TTL);
-        const bad = { ...revised(record()), schemaVersion: 2 } as unknown as WorkflowRun;
+        const bad = { ...revised(record()), schemaVersion: 99 } as unknown as WorkflowRun;
         await expect(store.compareAndSwap(bad, 0, lease)).rejects.toBeInstanceOf(
           CheckpointSchemaError,
         );
@@ -268,17 +279,73 @@ export function checkpointStoreContract(
       });
     });
 
+    describe("approval decisions", () => {
+      const decision = (requestId: string, approved: boolean): ApprovalDecision => ({
+        requestId,
+        nodeId: "review",
+        approved,
+        decidedAt: 2_000,
+        decidedBy: approved ? "ana" : "bo",
+        comment: "ok\u0000 ünïcode",
+      });
+
+      it("keeps the first decision per request, without a lease", async () => {
+        const { store, clock } = await setup();
+        if (!store.recordDecision || !store.loadDecisions) return;
+        const lease = await store.create(record(), "owner-a", TTL);
+        await expect(store.loadDecisions("run-1")).resolves.toEqual([]);
+        await expect(store.recordDecision("run-1", decision("req-1", true))).resolves.toEqual({
+          outcome: "recorded",
+          decision: decision("req-1", true),
+        });
+        // A second, conflicting decision loses and learns the first.
+        await expect(store.recordDecision("run-1", decision("req-1", false))).resolves.toEqual({
+          outcome: "already-decided",
+          decision: decision("req-1", true),
+        });
+        await store.recordDecision("run-1", decision("req-2", false));
+        const all = await store.loadDecisions("run-1");
+        expect([...all].sort((a, b) => a.requestId.localeCompare(b.requestId))).toEqual([
+          decision("req-1", true),
+          decision("req-2", false),
+        ]);
+        // The record and lease are untouched.
+        await expect(store.load("run-1")).resolves.toEqual(record());
+        clock.time += 1;
+        await expect(store.compareAndSwap(revised(record()), 0, lease)).resolves.toBe("ok");
+      });
+
+      it("rejects a decision for a missing run", async () => {
+        const { store } = await setup();
+        if (!store.recordDecision || !store.loadDecisions) return;
+        await expect(store.recordDecision("missing", decision("r", true))).rejects.toBeInstanceOf(
+          RunNotFoundError,
+        );
+        await expect(store.loadDecisions("missing")).resolves.toEqual([]);
+      });
+    });
+
     describe("delete", () => {
-      it("removes the record, its lease state and its control record", async () => {
+      it("removes the record, its lease state and its control records", async () => {
         const { store } = await setup();
         const lease = await store.create(record(), "owner-a", TTL);
         await store.requestCancel("run-1");
+        await store.recordDecision?.("run-1", {
+          requestId: "req",
+          nodeId: "n",
+          approved: true,
+          decidedAt: 1,
+        });
         await store.delete("run-1");
+        if (store.loadDecisions) await expect(store.loadDecisions("run-1")).resolves.toEqual([]);
         await expect(store.load("run-1")).resolves.toBeUndefined();
         await expect(store.isCancelRequested("run-1")).resolves.toBe(false);
         await expect(store.renewLease(lease, TTL)).resolves.toBeUndefined();
         await store.delete("run-1"); // idempotent
         await store.create(record(), "owner-b", TTL);
+        // Nothing of the old run carries over: decisions, cancel requests, leases.
+        if (store.loadDecisions) await expect(store.loadDecisions("run-1")).resolves.toEqual([]);
+        await expect(store.isCancelRequested("run-1")).resolves.toBe(false);
         // The old owner's lease does not carry over to the new run.
         await expect(store.compareAndSwap(revised(record()), 0, lease)).resolves.toBe("lease-lost");
       });

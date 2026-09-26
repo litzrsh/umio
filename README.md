@@ -30,11 +30,7 @@
 
 - **`umio` command-line interface.** Chat with a configured model and its tools, run one-shot prompts from scripts, check your setup with `umio doctor`, and run, inspect, cancel, resume and recover graph workflows. Built for multi-hour local calls.
 
-- **Graph workflows.** Branches, parallel nodes and joins, with retries, node timeouts, cancellation and observers. Every step is checkpointed, so a run survives a crash: completed nodes never re-run, and nodes whose outcome is unknown wait for an explicit recovery decision. Sized for local models where one call takes hours.
-
-**Planned**
-
-- Graph workflows: pause and approval, loops, a database-backed checkpoint store.
+- **Graph workflows.** Branches, parallel nodes and joins, bounded loops and human approval points, with retries, node timeouts, cancellation and observers. Every step is checkpointed, so a run survives a crash: completed nodes never re-run, and nodes whose outcome is unknown wait for an explicit recovery decision. Runs live in memory, in files, or in PostgreSQL for several processes and machines. Sized for local models where one call takes hours.
 
 ---
 
@@ -142,13 +138,29 @@ umio graph run review.workflow.mjs --input "Store uploads on local disk?"   # pr
 umio graph status <run-id>             # nodes, attempts, owner, and nodes needing recovery
 umio graph list [--needs-recovery]
 umio graph cancel <run-id> [--wait]    # from any terminal; see below
+umio graph approvals [<run-id>]        # approval requests waiting for a decision, with their context
+umio graph approve <run-id> <node-id> [--comment "…"]   # or: reject
 umio graph resume review.workflow.mjs <run-id>
 umio graph recover review.workflow.mjs <run-id> <node-id> --retry
 umio graph recover review.workflow.mjs <run-id> <node-id> --complete '{"text":"…"}'
 umio graph recover review.workflow.mjs <run-id> <node-id> --fail --reason "charged twice; refunded"
+umio graph migrate                     # once, for a PostgreSQL store
 ```
 
-- **Where runs are kept:** in `.umio/runs` next to the config (`--store <dir>` to change it), using the experimental `FileCheckpointStore`. Only one process writes it at a time. While another `umio` process holds it, `status` and `list` still work, `cancel` sends a request (below), and `resume` and `recover` fail immediately with a lock error that names the process. They do not wait; run them again once that process has finished.
+Exit codes for `run`, `resume` and `status`: 0 completed (or still running), 1 failed, 3 needs recovery, 4 paused for an approval, 130 cancelled.
+
+- **Where runs are kept:** by default in `.umio/runs` next to the config (`--store <dir>` to change it), using the experimental `FileCheckpointStore`. Only one process writes it at a time. While another `umio` process holds it, `status`, `list` and `approvals` still work, `cancel`, `approve` and `reject` send a request file (below), and `resume` and `recover` fail immediately with a lock error that names the process. They do not wait; run them again once that process has finished.
+- **PostgreSQL instead:** set `graph.checkpoint` in the config (or pass `--store postgres://…`), install the driver with `npm install pg`, and create the tables once with `umio graph migrate`. Every command then works while other processes, on any machine, drive runs in the same database:
+
+  ```json
+  "graph": {
+    "maxConcurrency": 1,
+    "checkpoint": { "type": "postgres", "connectionString": "${DATABASE_URL}", "schema": "umio" }
+  }
+  ```
+
+  `status` shows the database with its password hidden. A missing table is reported with the `migrate` hint.
+- **Approvals:** a run whose only remaining work waits for a person is `paused` (exit code 4), and no process owns it. `run`, `status` and `approvals` show each waiting request: its title and description, when it was asked, the run input and the outputs it concerns, and the exact `approve`/`reject` commands. A decision is recorded, never applied, by the command ("Approval recorded … not yet applied"): the process driving the run applies it within ~2 s, and a paused run applies it on `umio graph resume`. The first decision per request wins; a later, different one exits 1 with the decision that stands. `--by` defaults to your user name. These approvals are unrelated to chat's `y`/`n` confirmation before a tool runs.
 - **Cancelling from another terminal:** `umio graph cancel <run-id>` writes a small cancel-request file next to the run (atomically). It never writes the run's checkpoint or lease. The process driving the run checks for requests every ~2 s on its own timer, so it notices even during a silent multi-hour model call. It then cancels through its executor's normal, fenced path: running nodes are aborted and given their grace period, and the run is recorded `cancelled`.
   - **The reply distinguishes recorded from confirmed.** Without `--wait`, the command returns as soon as the request is stored: "Cancel request recorded — not yet confirmed". With `--wait` (up to `--timeout`, default 30 s), it watches the run until it ends: "Confirmed: run … is cancelled", or it reports that the run finished some other way first (exit 1), or that it is not confirmed yet (exit 1, and the request stays recorded).
   - `graph status` shows a request the owner has not picked up yet ("cancel requested 3s ago by pid …, not yet picked up by the owner"), and `--json` reports it as `cancelRequest: "pending" | "recorded" | "none"`.
@@ -566,13 +578,14 @@ const definition: WorkflowDefinition = {
 };
 
 const run = await WorkflowExecutor.fromConfig(llm.config).run(definition, "Review this plan: …");
-run.status;               // "completed" | "failed" | "cancelled" | "needs-recovery"
+run.status;               // "completed" | "failed" | "cancelled" | "needs-recovery" | "paused"
 run.nodes.merge?.output;  // { text, usage } from agentNode
 ```
 
 **Definitions and validation**
 - The graph is plain JSON. Handlers and predicates are registered by key, and `validateDefinition` runs before every run.
-- Validation reports every problem at once: cycles, unknown nodes or handlers, unreachable nodes, invalid joins, non-JSON values.
+- Validation reports every problem at once: cycles, unknown nodes or handlers, unreachable nodes, invalid joins, non-JSON values. Cycles are always rejected; repeat work with an explicit, bounded loop node (below).
+- A node is a **task** (`handler`), an **approval** (`approval`) or a **loop** (`loop`). `retry`, `timeoutMs`, `inactivityTimeoutMs` and `recovery` apply to task nodes only.
 - Each run records the definition's `version` and a `definitionHash`.
 
 **Handlers**
@@ -614,7 +627,7 @@ run.nodes.merge?.output;  // { text, usage } from agentNode
 - A failure and a cancel never both apply: whichever the executor processes first decides the run's status.
 
 **Observers**
-- `run(definition, input, { observer, onObserverError })` delivers events in order: `run-start`/`run-resume`, `node-start`, `node-event` (from `context.emit`), `node-retry`, `node-finish` (with its status, including `skipped`), `run-cancel-requested`, then `run-finish` or `run-needs-recovery`.
+- `run(definition, input, { observer, onObserverError })` delivers events in order: `run-start`/`run-resume`, `node-start`, `node-event` (from `context.emit`), `node-retry`, `node-waiting` (an approval request), `loop-iteration`, `node-finish` (with its status, including `skipped`), `run-cancel-requested`, then `run-finish`, `run-needs-recovery` or `run-paused`.
 - Delivery is queued: the scheduler never waits for the observer, and an observer that throws or hangs changes neither the run nor its timing. Errors go to `onObserverError`.
 - When the run ends, its status is persisted and its lease released first; then `run()` waits at most `observerDrainTimeoutMs` (5 s) for queued events. Events not delivered by then are dropped, never the status.
 
@@ -628,7 +641,79 @@ run.nodes.merge?.output;  // { text, usage } from agentNode
 - The executor holds a **lease** on each run it owns (30 s, renewed every 10 s on its own timer), so a model call that is silent for hours never looks like a dead executor. Every write is a compare-and-swap fenced by that lease: once another owner could have taken over, the old one cannot write.
 - If the lease is lost, the executor aborts running nodes, writes nothing more and rejects with `LeaseLostError`. A write that conflicts under a valid lease rejects with `CheckpointConflictError`.
 - Custom stores implement `CheckpointStore` and should pass the contract suite in `test/checkpoint-contract.ts`. umio never claims exactly-once execution: use `idempotencyKey` to deduplicate side effects.
-- `FileCheckpointStore.open({ dir })` keeps runs on disk so they survive a restart. It is **experimental and single-process only**: never share its directory between processes. It refuses to open a directory another live process is using. Other processes can still read runs with `FileCheckpointStore.snapshot()`/`snapshots()`, and ask the holder to cancel one with `FileCheckpointStore.submitCancelRequest(dir, runId)`. That call writes a separate control file, which the holder applies on its next cancel check; it never writes the run itself.
+- `FileCheckpointStore.open({ dir })` keeps runs on disk so they survive a restart. It is **experimental and single-process only**: never share its directory between processes. It refuses to open a directory another live process is using. Other processes can still read runs with `FileCheckpointStore.snapshot()`/`snapshots()`, ask the holder to cancel one with `FileCheckpointStore.submitCancelRequest(dir, runId)`, and record an approval decision with `FileCheckpointStore.submitDecision(dir, runId, decision)`. Both write separate control files (a decision file is created exclusively, so the first wins), which the holder applies on its next poll; they never write the run itself. For several processes, use `PostgresCheckpointStore`.
+
+**Approvals (durable pause)**
+- An approval node records a request (`title`, `description`, and which predecessors' outputs it concerns) with a random `requestId`, and the node is `waiting`. No code runs for it.
+- Other branches keep running. Once only a decision can move the run on (nothing running, ready or scheduled for retry), the run is written `paused`, its lease is released and `run()` resolves; the process can exit. No timeout applies to the wait.
+- `executor.pendingApprovals(runId)` returns each waiting request with the run input, the context outputs and any decision recorded but not yet applied. `pendingApprovalsOf(record, decisions)` does the same from a record.
+- `executor.approve(runId, target, { decidedBy?, comment? })` and `reject(…)` work from any process sharing the store; `target` is the node's checkpoint ID or the request ID. The store keeps the **first decision per request** (atomic insert-if-absent); a later call returns `already-decided` with the winning decision. Other outcomes: `recorded`, `not-pending`, `already-terminal`, `not-found`.
+- A recorded decision is applied to the run once, by whoever owns it: the live owner within `cancelPollIntervalMs` (2 s), or `resume()` of a `paused` run (which otherwise returns `paused` again without writing). The node's waiting state and the decision's effect are one write, so a crash never applies it twice; completed nodes, including the side effects after the approval, never re-run.
+- **Approval** completes the node with `{ approved: true, requestId, decidedAt, decidedBy?, comment? }` and its successors run. **Rejection** by default fails the node (`approval-rejected`, with the comment) and so the run. With `approval: { onReject: "continue" }` the node completes with `approved: false` instead, and its outgoing edges decide what runs next; every one of them must then have a `when` predicate, so a rejection cannot pass through unguarded.
+- `cancel()` of a paused run finalizes it (`cancelled`); waiting requests are closed and can no longer be decided. A run that fails or is cancelled closes its waiting requests too.
+- Stores keep decisions through the optional `recordDecision`/`loadDecisions` methods; the memory, file and PostgreSQL stores have them, and approval workflows are refused on a store without them.
+
+```typescript
+const definition: WorkflowDefinition = {
+  graph: {
+    id: "release", version: "1", entry: ["plan"],
+    nodes: [
+      { id: "plan", handler: "plan" },
+      { id: "approve", approval: { title: "Deploy to production?", description: "Runs the migration." } },
+      { id: "deploy", handler: "deploy" },   // uses context.idempotencyKey for its side effect
+    ],
+    edges: [{ from: "plan", to: "approve" }, { from: "approve", to: "deploy" }],
+  },
+  handlers: { plan, deploy },
+  predicates: {},
+};
+let run = await executor.run(definition, input, { runId: "release-42" });   // → "paused"
+// Later, any process:
+await executor.approve("release-42", "approve", { decidedBy: "ana", comment: "go" });
+run = await executor.resume(definition, "release-42");                        // → "completed"
+```
+
+**Loops**
+- A loop node runs a `body` (a small DAG of its own: `nodes`, `edges`, `entry`) once per iteration. After each iteration its `until` predicate receives the iteration's output (the outputs of the body's exit nodes, by body node ID) and the run input; `true` ends the loop. `maxIterations` (1–10 000) is required. If `until` still fails then, the loop node fails with `loop-exhausted`, or completes with `exhausted: true` under `onExhausted: "complete"`.
+- The loop node's output is `{ iterations, exhausted, outputs }` (the last iteration's output); its successors receive it like any predecessor output, and it is checked against the loop node's `maxOutputBytes`. A result that is too large parks the loop node as `uncertain` (`invalid-output`); `recoverNode` can `complete` it with an `ArtifactRef` (retrying a loop node is refused, since its iterations already ran).
+- Every iteration's nodes are recorded under their own ID, `<loop>#<n>/<node>` (e.g. `refine#2/draft`), which is also their `context.nodeId` and makes their `idempotencyKey` distinct per iteration. Handlers get `context.loop: { id, iteration, previous }`, where `previous` is the prior iteration's output; body entry nodes receive the loop node's predecessors.
+- The `until` result is recorded on the loop node (`loop.decisions`) in the same write that creates the next iteration's nodes, so recovery can neither skip nor repeat an iteration; an iteration that finished just before a crash is decided on resume from its recorded outputs (`until` must be pure).
+- Inside an iteration the usual rules apply per node: retries (attempts count per iteration), timeouts, joins and conditional edges, output limits, and `uncertain` nodes, which are recovered under their iteration ID (`recoverNode(…, "refine#2/draft", …)`). A failing body node fails the loop node (`loop-body-failed`) and the run; a cancel stops the running body node and cancels the loop node.
+- Approval nodes may sit in a body, which gives "revise until approved": `onReject: "continue"` and `until: (out) => out.review.approved`. Each iteration asks again with a new request.
+- Loops cannot nest, and body edges stay inside the body; the outer graph connects to the loop node.
+
+```typescript
+{
+  id: "refine",
+  loop: {
+    body: {
+      entry: ["draft"],
+      nodes: [{ id: "draft", handler: "draft" }, { id: "check", handler: "check" }],
+      edges: [{ from: "draft", to: "check" }],
+    },
+    until: "goodEnough",          // predicates.goodEnough = (out) => out.check.score >= 8
+    maxIterations: 5,
+  },
+}
+```
+
+**PostgreSQL checkpoint store**
+- `PostgresCheckpointStore` lets executors in several processes or on several machines share runs. It takes any client with `query(text, values)` returning `{ rows }`; a `pg.Pool` works as is (`npm install pg`; umio lists it as an optional peer dependency).
+- Correctness rests on the database only: every write is a single `UPDATE … WHERE` that checks the lease token, owner, expiry (by the database clock) and revision on the row it locks; fencing tokens come from one sequence, so they only grow, even across deleted and re-created runs; cancel requests are a flag and decisions a table keyed per request, writable by anyone without a lease.
+- Create the tables once: `PostgresCheckpointStore.migrate(pool, { schema?, tablePrefix? })` (idempotent, under an advisory lock), or run `postgresSchemaSql()` with your migration tool. Records are stored as `json`, verbatim.
+- `store.snapshot(runId)` and `store.snapshots({ status? })` read runs with their lease, cancel and decision state, for dashboards.
+
+```typescript
+import pg from "pg";
+import { PostgresCheckpointStore, WorkflowExecutor } from "umio";
+
+const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
+await PostgresCheckpointStore.migrate(pool);
+const executor = WorkflowExecutor.fromConfig(llm.config, { store: new PostgresCheckpointStore({ client: pool }) });
+```
+
+**Checkpoint format**
+- Runs whose definition has only task nodes are written as `schemaVersion: 1`, as before, so earlier umio versions can still read them. Runs with approval or loop nodes are written as `schemaVersion: 2` (adding the `paused` and `waiting` statuses and the `approval`/`loop` node fields); earlier versions refuse them with `CheckpointSchemaError` rather than misread them. This version reads both; nothing is migrated in place.
 
 **Resuming after a crash**
 - `executor.resume(definition, runId)` continues a run whose process died. Pass the same definition (graph ID, `version`, structure) with fresh handlers; a mismatch rejects with `DefinitionMismatchError`.
@@ -877,7 +962,8 @@ Pass a `providerFactory` to `new LLM(config, { providerFactory })` to add a prov
 npm run build        # tsup → dist/ (ESM + CJS + .d.ts)
 npm run typecheck    # tsc --noEmit
 npm run lint         # biome check (npm run format to auto-fix)
-npm test             # vitest run
+npm test             # vitest run (the PostgreSQL store's contract suite runs on PGlite, in process)
+npm run test:postgres  # multi-client and multi-process tests against a real server (UMIO_TEST_POSTGRES_URL)
 npm run schema       # regenerate schema/umio.config.schema.json from the Zod schema
 npm run example -- local "Hello"   # call a model from ./umio.config.json
 npm run example:tools -- local     # streaming tool loop (UMIO_CONFIG=path to use another config)
@@ -885,6 +971,8 @@ npm run example:workflow -- local  # two-agent workflow with ADRs
 npm run example:project -- local   # agent answering questions about this repo with built-in tools
 npm run example:graph -- local     # diamond review graph with a conditional branch
 ```
+
+For `test:postgres`, start a server first, e.g. `docker run -d -p 55432:5432 -e POSTGRES_USER=umio -e POSTGRES_PASSWORD=umio postgres:17-alpine`; the default URL is `postgres://umio:umio@localhost:55432/umio`.
 
 Run a single test file or test name:
 

@@ -22,7 +22,7 @@ function definition(
   predicates: WorkflowDefinition["predicates"] = {},
 ): WorkflowDefinition {
   const registered: Record<string, NodeHandler> = { ...handlers };
-  for (const node of graph.nodes) registered[node.handler] ??= noop;
+  for (const node of graph.nodes) if (node.handler) registered[node.handler] ??= noop;
   return { graph: { id: "wf", version: "1", ...graph }, handlers: registered, predicates };
 }
 

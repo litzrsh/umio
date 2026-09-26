@@ -3,6 +3,7 @@
  * controllable handlers and an event recorder.
  */
 import type {
+  ApprovalDecision,
   CasResult,
   CheckpointStore,
   EdgeSpec,
@@ -103,6 +104,15 @@ export class ProcessStore implements CheckpointStore {
   }
   delete(runId: string) {
     return this.call("delete", () => this.inner.delete(runId));
+  }
+  recordDecision(runId: string, decision: ApprovalDecision) {
+    return this.call("recordDecision", () => {
+      if (!this.inner.recordDecision) throw new Error("inner store keeps no decisions");
+      return this.inner.recordDecision(runId, decision);
+    });
+  }
+  loadDecisions(runId: string) {
+    return this.call("loadDecisions", async () => (await this.inner.loadDecisions?.(runId)) ?? []);
   }
 
   /** Writes that left the run in a status other than `running`. */

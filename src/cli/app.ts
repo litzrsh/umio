@@ -33,8 +33,9 @@ import { oneLine, runStatusLabel, turnFooter } from "./format.js";
 import {
   type CancelReport,
   cancelRun,
-  defaultStoreFor,
-  listSnapshots,
+  type DecisionReport,
+  decideApproval,
+  listApprovals,
   readInput,
   recoverGraph,
   resumeGraph,
@@ -44,9 +45,11 @@ import {
 } from "./graph.js";
 import { helpFor } from "./help.js";
 import { ChatSession } from "./session.js";
+import { type CliStore, openCliStore, type PgModule } from "./store.js";
 import { createStyle, detectColor } from "./style.js";
 import { type OutputStream, Terminal, type Timers } from "./terminal.js";
 import {
+  approvalLines,
   resultOutputs,
   runJson,
   runReport,
@@ -81,9 +84,18 @@ export interface CliDeps {
   readonly createModel?: (config: UmioConfig) => ModelClient;
   readonly timers?: Timers;
   readonly version?: string;
+  /** Loads the `pg` module for a PostgreSQL store; tests pass their own. */
+  readonly loadPg?: () => Promise<PgModule>;
 }
 
-export const EXIT = { ok: 0, error: 1, usage: 2, needsRecovery: 3, cancelled: 130 } as const;
+export const EXIT = {
+  ok: 0,
+  error: 1,
+  usage: 2,
+  needsRecovery: 3,
+  paused: 4,
+  cancelled: 130,
+} as const;
 
 export interface Context {
   readonly io: CliIO;
@@ -214,23 +226,73 @@ export async function runGraphCommand(
   const { io, options, terminal } = context;
   const now = () => terminal.timers.now();
 
-  // Read-only commands: no config needed beyond locating the store.
+  // Commands that only touch the store: the config is read for its location, if there is one.
   if (
     command.kind === "graph-status" ||
     command.kind === "graph-list" ||
-    command.kind === "graph-cancel"
+    command.kind === "graph-cancel" ||
+    command.kind === "graph-approvals" ||
+    command.kind === "graph-decide" ||
+    command.kind === "graph-migrate"
   ) {
     const configPath = await findConfig(io.cwd, io.env, options.config).catch(() => undefined);
-    const dir = defaultStoreFor(configPath, io.cwd, options.store);
-    if (command.kind === "graph-status") {
-      const snapshot = await runSnapshot(dir, command.runId);
-      const holder = await storeHolder(dir);
+    const located = configPath ? await loadCliConfig(io.cwd, io.env, configPath) : undefined;
+    const backend = await openBackend(context, located);
+    try {
+      return await storeCommand(command, context, backend, now);
+    } finally {
+      await backend.close();
+    }
+  }
+
+  const located = await loadCliConfig(io.cwd, io.env, options.config);
+  const llm = modelClient(context, located.config);
+  const backend = await openBackend(context, located);
+  const env = {
+    cwd: io.cwd,
+    config: located.config,
+    configDir: dirname(located.path),
+    llm,
+    backend,
+  };
+  try {
+    return await workflowCommand(command, context, env, replSignal);
+  } finally {
+    await backend.close();
+  }
+}
+
+function openBackend(context: Context, located: LocatedConfig | undefined): Promise<CliStore> {
+  const { io, options, deps } = context;
+  return openCliStore({
+    cwd: io.cwd,
+    ...(located && { configDir: dirname(located.path) }),
+    ...(options.store !== undefined && { explicit: options.store }),
+    ...(located?.config.graph?.checkpoint && { checkpoint: located.config.graph.checkpoint }),
+    ...(deps.loadPg && { loadPg: deps.loadPg }),
+  });
+}
+
+/** status, list, cancel, approvals, approve/reject, migrate. */
+async function storeCommand(
+  command: Command,
+  context: Context,
+  backend: CliStore,
+  now: () => number,
+): Promise<number> {
+  const { options, terminal } = context;
+  const holderOf = async () =>
+    backend.kind === "file" ? await storeHolder(backend.dir) : undefined;
+  switch (command.kind) {
+    case "graph-status": {
+      const snapshot = await runSnapshot(backend, command.runId);
+      const holder = await holderOf();
       if (options.json) return json(context, runJson(snapshot, now(), holder));
       for (const line of snapshotReport(snapshot, terminal, now(), holder)) terminal.line(line);
       return statusCode(snapshot.record.status);
     }
-    if (command.kind === "graph-list") {
-      const runs = (await listSnapshots(dir)).filter(
+    case "graph-list": {
+      const runs = (await backend.list()).filter(
         (run) => !command.needsRecovery || run.record.status === "needs-recovery",
       );
       if (options.json)
@@ -238,46 +300,80 @@ export async function runGraphCommand(
           context,
           runs.map((run) => runJson(run, now())),
         );
-      if (runs.length === 0) terminal.note(`No runs in ${dir}.`);
+      if (runs.length === 0) terminal.note(`No runs in ${backend.location}.`);
       for (const { record } of runs) {
-        const uncertain = Object.values(record.nodes).filter(
-          (node) => node.status === "uncertain",
-        ).length;
+        const nodes = Object.values(record.nodes);
+        const uncertain = nodes.filter((node) => node.status === "uncertain").length;
+        const waiting = nodes.filter((node) => node.status === "waiting").length;
         terminal.line(
-          `${record.runId}  ${runStatusLabel(record.status, terminal.style)}  ${terminal.style.dim(`${record.workflowId} · updated ${new Date(record.updatedAt).toLocaleString()}${uncertain ? ` · ${uncertain} uncertain` : ""}`)}`,
+          `${record.runId}  ${runStatusLabel(record.status, terminal.style)}  ${terminal.style.dim(`${record.workflowId} · updated ${new Date(record.updatedAt).toLocaleString()}${uncertain ? ` · ${uncertain} uncertain` : ""}${waiting ? ` · ${waiting} awaiting approval` : ""}`)}`,
         );
       }
       return EXIT.ok;
     }
-    if (command.wait && !options.json) {
-      terminal.note(
-        terminal.style.dim(
-          `Waiting up to ${formatDuration(command.timeoutMs)} for the run to stop…`,
-        ),
-      );
+    case "graph-approvals": {
+      const approvals = await listApprovals(backend, command.runId);
+      if (options.json) return json(context, approvals);
+      if (approvals.length === 0) {
+        terminal.note(
+          command.runId
+            ? `Run ${command.runId} has no approval waiting.`
+            : `No approvals waiting in ${backend.location}.`,
+        );
+      }
+      for (const line of approvalLines(approvals, terminal, options.verbose)) terminal.line(line);
+      return EXIT.ok;
     }
-    const report = await cancelRun(dir, command.runId, {
-      wait: command.wait,
-      timeoutMs: command.timeoutMs,
-      now,
-    });
-    if (options.json) {
-      json(context, report);
-    } else {
-      for (const line of cancelReportLines(report, terminal)) terminal.line(line);
+    case "graph-decide": {
+      const report = await decideApproval(backend, command, now);
+      if (options.json) json(context, report);
+      else for (const line of decisionReportLines(report, terminal)) terminal.line(line);
+      return decisionExitCode(report);
     }
-    return cancelExitCode(report);
+    case "graph-migrate": {
+      if (backend.kind === "file") {
+        terminal.line(`The file store needs no setup (${backend.location}).`);
+        return EXIT.ok;
+      }
+      await backend.migrate();
+      if (options.json) return json(context, { migrated: true, store: backend.location });
+      terminal.line(`Checkpoint tables are ready in ${backend.location}.`);
+      return EXIT.ok;
+    }
+    case "graph-cancel": {
+      if (command.wait && !options.json) {
+        terminal.note(
+          terminal.style.dim(
+            `Waiting up to ${formatDuration(command.timeoutMs)} for the run to stop…`,
+          ),
+        );
+      }
+      const report = await cancelRun(backend, command.runId, {
+        wait: command.wait,
+        timeoutMs: command.timeoutMs,
+        now,
+      });
+      if (options.json) {
+        json(context, report);
+      } else {
+        for (const line of cancelReportLines(report, terminal)) terminal.line(line);
+      }
+      return cancelExitCode(report);
+    }
+    default:
+      throw new CliError(`Unsupported command ${command.kind}.`);
   }
+}
 
-  const located = await loadCliConfig(io.cwd, io.env, options.config);
-  const llm = modelClient(context, located.config);
-  const env = {
-    cwd: io.cwd,
-    config: located.config,
-    configDir: dirname(located.path),
-    llm,
-    ...(options.store && { store: options.store }),
-  };
+/** run, resume, recover: they load the workflow module. */
+async function workflowCommand(
+  command: Command,
+  context: Context,
+  env: Parameters<typeof runGraph>[0],
+  replSignal: AbortSignal | undefined,
+): Promise<number> {
+  const { io, options, terminal } = context;
+  const now = () => terminal.timers.now();
 
   if (command.kind === "graph-recover") {
     const run = await recoverGraph(env, command);
@@ -301,11 +397,11 @@ export async function runGraphCommand(
   replSignal?.addEventListener("abort", () => controller.abort(), { once: true });
   const activity = new Activity(now(), { kind: "graph", running: [], done: 0, total: 0 });
   const view = new TerminalGraphView(terminal, activity);
-  let edges: readonly { from: string }[] | undefined;
-  const recordEdges = view.definition.bind(view);
+  let graph: { edges: readonly { from: string }[]; nodes: readonly { id: string }[] } | undefined;
+  const recordDefinition = view.definition.bind(view);
   view.definition = (definition) => {
-    edges = definition.graph.edges;
-    recordEdges(definition);
+    graph = definition.graph;
+    recordDefinition(definition);
   };
   const stopSignals = replSignal
     ? () => {}
@@ -330,7 +426,7 @@ export async function runGraphCommand(
     terminal.stopActivity();
     stopSignals();
   }
-  const results = resultOutputs(run, edges);
+  const results = resultOutputs(run, graph);
   if (options.json) return json(context, { ...runJson({ record: run }, now()), results });
   terminal.line();
   for (const line of runReport(run, terminal, now(), { module: command.module }))
@@ -408,6 +504,58 @@ export function cancelReportLines(report: CancelReport, terminal: Terminal): str
   return lines;
 }
 
+/** Words for an approval decision: always says whether it is only recorded or already applied. */
+export function decisionReportLines(report: DecisionReport, terminal: Terminal): string[] {
+  const { style } = terminal;
+  const { runId, target } = report;
+  const verb = report.approved ? "Approval" : "Rejection";
+  const who = (decision: DecisionReport["decision"]) =>
+    decision
+      ? `${decision.approved ? "approved" : "rejected"}${decision.decidedBy ? ` by ${decision.decidedBy}` : ""} at ${new Date(decision.decidedAt).toLocaleString()}`
+      : "decided";
+  switch (report.outcome) {
+    case "not-found":
+      return [`No run "${runId}".`];
+    case "already-terminal":
+      return [`Nothing to decide: run ${runId} is already ${report.status}.`];
+    case "not-pending":
+      return [
+        `Run ${runId} has no approval "${target}" waiting.`,
+        style.dim(
+          report.waiting?.length
+            ? `  Waiting: ${report.waiting.join(", ")} (see \`umio graph approvals ${runId}\`).`
+            : "  It has no approval waiting.",
+        ),
+      ];
+    case "already-decided":
+      return [
+        (report.decision?.approved === report.approved ? style.dim : style.yellow)(
+          `Already decided: ${target} was ${who(report.decision)}. Your decision was not recorded.`,
+        ),
+      ];
+    case "recorded":
+      return [
+        `${verb} recorded for run ${runId}, ${target} — ${style.bold("not yet applied")}.`,
+        style.dim(
+          report.status === "paused"
+            ? `  The run is paused. Continue it with: umio graph resume <module> ${runId}`
+            : report.ownerActive
+              ? "  The umio process driving the run applies it within ~2 s."
+              : `  No process is driving the run now; it is applied when the run is resumed (umio graph resume <module> ${runId}).`,
+        ),
+      ];
+  }
+}
+
+/** 0 when recorded, or when the same decision was already recorded; 1 otherwise. */
+function decisionExitCode(report: DecisionReport): number {
+  if (report.outcome === "recorded") return EXIT.ok;
+  if (report.outcome === "already-decided" && report.decision?.approved === report.approved) {
+    return EXIT.ok;
+  }
+  return EXIT.error;
+}
+
 /** 0 when recorded (without --wait) or confirmed; 1 when not found, timed out, or the run ended otherwise. */
 function cancelExitCode(report: CancelReport): number {
   if (report.outcome === "not-found") return EXIT.error;
@@ -423,6 +571,8 @@ function statusCode(status: WorkflowRun["status"]): number {
       return EXIT.ok;
     case "needs-recovery":
       return EXIT.needsRecovery;
+    case "paused":
+      return EXIT.paused;
     case "cancelled":
       return EXIT.cancelled;
     default:

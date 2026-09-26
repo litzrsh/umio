@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { Readable } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
 import { type CliIO, runCli } from "../src/cli/app.js";
+import type { PgModule } from "../src/cli/store.js";
 import type {
   GenerateRequest,
   GenerateResult,
@@ -15,6 +16,7 @@ import type {
   StreamEvent,
   ToolCallPart,
 } from "../src/index.js";
+import { pglite } from "./support/postgres.js";
 
 const dirs: string[] = [];
 afterEach(async () => {
@@ -501,5 +503,152 @@ describe("umio graph", () => {
     expect(io.stderr.text).toMatch(
       /does not export a workflow definition\.\nhint: Use `export default \{ graph, handlers, predicates \}`/,
     );
+  });
+
+  const release = `
+    export default {
+      graph: {
+        id: "release", version: "1", entry: ["plan"],
+        nodes: [
+          { id: "plan", handler: "plan" },
+          { id: "approve", approval: { title: "Deploy to production?", description: "Runs the migration." } },
+          { id: "deploy", handler: "deploy" },
+        ],
+        edges: [{ from: "plan", to: "approve" }, { from: "approve", to: "deploy" }],
+      },
+      handlers: {
+        plan: async () => ({ steps: ["migrate", "restart"] }),
+        deploy: async (c) => ({ text: "deployed after " + c.predecessors.approve.decidedBy }),
+      },
+      predicates: {},
+    };`;
+
+  /** run → paused (4) → approvals → approve → a conflicting reject loses → resume → completed. */
+  async function approvalFlow(dir: string, extra: string[], deps = {}) {
+    const path = await module(dir, release);
+    const cli = async (args: string[]) => {
+      const { io } = fakeIO(dir);
+      const code = await runCli([...args, ...extra, "--no-color"], io, deps);
+      return { code, out: io.stdout.text, err: io.stderr.text };
+    };
+    const run = await cli(["graph", "run", path, "--run-id", "r1"]);
+    expect(run.code).toBe(4);
+    expect(run.err).toMatch(/‖ approve waiting for approval/);
+    expect(run.out).toMatch(/r1 · release@1 · ‖ paused \(waiting for approval\)/);
+    expect(run.out).toMatch(/approve +‖ waiting for approval/);
+    expect(run.out).toMatch(/umio graph approve r1 approve \[--comment "…"\]/);
+    expect(run.out).toMatch(/continue with: umio graph resume .*wf\.mjs r1/);
+
+    const approvals = await cli(["graph", "approvals"]);
+    expect(approvals.code).toBe(0);
+    expect(approvals.out).toMatch(
+      /r1 · release · approve · Deploy to production\?\n {2}Runs the migration\./,
+    );
+    expect(approvals.out).toMatch(/plan:\n {4}\{\n {4} {2}"steps": \[/);
+    const json = await cli(["graph", "approvals", "r1", "--json"]);
+    expect(JSON.parse(json.out)).toMatchObject([
+      { runId: "r1", nodeId: "approve", context: { plan: { steps: ["migrate", "restart"] } } },
+    ]);
+
+    const approve = await cli([
+      "graph",
+      "approve",
+      "r1",
+      "approve",
+      "--by",
+      "ana",
+      "--comment",
+      "ok",
+    ]);
+    expect(approve.code).toBe(0);
+    expect(approve.out).toMatch(
+      /Approval recorded for run r1, approve — not yet applied\.\n {2}The run is paused\. Continue it with/,
+    );
+    const reject = await cli(["graph", "reject", "r1", "approve", "--by", "bo"]);
+    expect(reject.code).toBe(1);
+    expect(reject.out).toMatch(/Already decided: approve was approved by ana/);
+    const status = await cli(["graph", "status", "r1", "--json"]);
+    expect(JSON.parse(status.out)).toMatchObject({
+      status: "paused",
+      owner: expect.stringMatching(/^paused — waiting for 1 approval/),
+      approvals: [{ nodeId: "approve", decision: { approved: true, decidedBy: "ana" } }],
+    });
+
+    const resume = await cli(["graph", "resume", path, "r1"]);
+    expect(resume.code).toBe(0);
+    expect(resume.out).toMatch(/✓ completed[\s\S]*deploy:\ndeployed after ana/);
+    const again = await cli(["graph", "approve", "r1", "approve"]);
+    expect(again.code).toBe(1);
+    expect(again.out).toMatch(/Nothing to decide: run r1 is already completed\./);
+    const missing = await cli(["graph", "approve", "nope", "x"]);
+    expect(missing.out).toMatch(/No run "nope"/);
+  }
+
+  it("pauses at an approval, lists it with context, records one decision, and resumes", async () => {
+    await approvalFlow(await project(), []);
+  });
+
+  it("does the same on PostgreSQL (--store postgres://…), after `graph migrate`", async () => {
+    const dir = await project();
+    const db = await pglite();
+    const loadPg = async (): Promise<PgModule> => ({
+      Pool: class {
+        query = db.query;
+        async end() {}
+      },
+    });
+    try {
+      const store = ["--store", "postgres://umio:secret@db.example:5432/umio"];
+      const before = fakeIO(dir);
+      expect(await runCli(["graph", "list", ...store], before.io, { loadPg })).toBe(1);
+      expect(before.io.stderr.text).toMatch(/tables do not exist[\s\S]*umio graph migrate/);
+      const migrate = fakeIO(dir);
+      expect(await runCli(["graph", "migrate", ...store], migrate.io, { loadPg })).toBe(0);
+      expect(migrate.io.stdout.text).toMatch(
+        /Checkpoint tables are ready in postgres postgres:\/\/umio:\*\*\*@db\.example:5432\/umio/,
+      );
+      await approvalFlow(dir, store, { loadPg });
+    } finally {
+      await db.close();
+    }
+  });
+
+  it("runs a bounded loop and reports its iterations; body nodes are not results", async () => {
+    const dir = await project();
+    const path = await module(
+      dir,
+      `export default {
+        graph: {
+          id: "loop", version: "1", entry: ["refine"],
+          nodes: [{ id: "refine", loop: {
+            body: { entry: ["draft"], nodes: [{ id: "draft", handler: "draft" }], edges: [] },
+            until: "good", maxIterations: 5 } }],
+          edges: [],
+        },
+        handlers: { draft: async (c) => ({ score: c.loop.iteration }) },
+        predicates: { good: (out) => out.draft.score >= 2 },
+      };`,
+    );
+    const { io } = fakeIO(dir);
+    expect(await runCli(["graph", "run", path, "--run-id", "l1", "--no-color"], io)).toBe(0);
+    expect(io.stderr.text).toMatch(/↻ refine iteration 1[\s\S]*↻ refine iteration 2/);
+    expect(io.stdout.text).toMatch(/refine +✓ completed · 2 iterations/);
+    expect(io.stdout.text).toMatch(/refine#2\/draft +✓ completed · attempt 1/);
+    expect(io.stdout.text).toMatch(/\nrefine:\n\{\n {2}"iterations": 2,/);
+    expect(io.stdout.text).not.toMatch(/\nrefine#1\/draft:\n/);
+    const status = fakeIO(dir);
+    await runCli(["graph", "status", "l1", "--json"], status.io);
+    expect(JSON.parse(status.io.stdout.text).nodes[0]).toMatchObject({
+      nodeId: "refine",
+      iteration: 2,
+      loopDecisions: [false, true],
+    });
+  });
+
+  it("migrate needs nothing for the file store", async () => {
+    const dir = await project();
+    const { io } = fakeIO(dir);
+    expect(await runCli(["graph", "migrate"], io)).toBe(0);
+    expect(io.stdout.text).toMatch(/The file store needs no setup/);
   });
 });

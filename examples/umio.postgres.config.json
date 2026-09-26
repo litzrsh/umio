@@ -1,0 +1,21 @@
+{
+  "$schema": "../schema/umio.config.schema.json",
+  "defaultModel": "local",
+  "providers": {
+    "ollama": {
+      "type": "ollama",
+      "baseURL": "${OLLAMA_BASE_URL:-http://localhost:11434/v1}"
+    }
+  },
+  "models": {
+    "local": { "provider": "ollama", "model": "llama3.2" }
+  },
+  "graph": {
+    "maxConcurrency": 1,
+    "checkpoint": {
+      "type": "postgres",
+      "connectionString": "${DATABASE_URL:-postgres://umio:umio@localhost:5432/umio}",
+      "schema": "umio"
+    }
+  }
+}
