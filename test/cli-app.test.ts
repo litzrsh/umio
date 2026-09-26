@@ -16,7 +16,7 @@ import type {
   StreamEvent,
   ToolCallPart,
 } from "../src/index.js";
-import { pglite } from "./support/postgres.js";
+import { PGLITE_TIMEOUT_MS, pglite } from "./support/postgres.js";
 
 const dirs: string[] = [];
 afterEach(async () => {
@@ -588,30 +588,34 @@ describe("umio graph", () => {
     await approvalFlow(await project(), []);
   });
 
-  it("does the same on PostgreSQL (--store postgres://…), after `graph migrate`", async () => {
-    const dir = await project();
-    const db = await pglite();
-    const loadPg = async (): Promise<PgModule> => ({
-      Pool: class {
-        query = db.query;
-        async end() {}
-      },
-    });
-    try {
-      const store = ["--store", "postgres://umio:secret@db.example:5432/umio"];
-      const before = fakeIO(dir);
-      expect(await runCli(["graph", "list", ...store], before.io, { loadPg })).toBe(1);
-      expect(before.io.stderr.text).toMatch(/tables do not exist[\s\S]*umio graph migrate/);
-      const migrate = fakeIO(dir);
-      expect(await runCli(["graph", "migrate", ...store], migrate.io, { loadPg })).toBe(0);
-      expect(migrate.io.stdout.text).toMatch(
-        /Checkpoint tables are ready in postgres postgres:\/\/umio:\*\*\*@db\.example:5432\/umio/,
-      );
-      await approvalFlow(dir, store, { loadPg });
-    } finally {
-      await db.close();
-    }
-  });
+  it(
+    "does the same on PostgreSQL (--store postgres://…), after `graph migrate`",
+    async () => {
+      const dir = await project();
+      const db = await pglite();
+      const loadPg = async (): Promise<PgModule> => ({
+        Pool: class {
+          query = db.query;
+          async end() {}
+        },
+      });
+      try {
+        const store = ["--store", "postgres://umio:secret@db.example:5432/umio"];
+        const before = fakeIO(dir);
+        expect(await runCli(["graph", "list", ...store], before.io, { loadPg })).toBe(1);
+        expect(before.io.stderr.text).toMatch(/tables do not exist[\s\S]*umio graph migrate/);
+        const migrate = fakeIO(dir);
+        expect(await runCli(["graph", "migrate", ...store], migrate.io, { loadPg })).toBe(0);
+        expect(migrate.io.stdout.text).toMatch(
+          /Checkpoint tables are ready in postgres postgres:\/\/umio:\*\*\*@db\.example:5432\/umio/,
+        );
+        await approvalFlow(dir, store, { loadPg });
+      } finally {
+        await db.close();
+      }
+    },
+    PGLITE_TIMEOUT_MS,
+  );
 
   it("runs a bounded loop and reports its iterations; body nodes are not results", async () => {
     const dir = await project();
@@ -652,56 +656,62 @@ describe("umio graph", () => {
     expect(io.stdout.text).toMatch(/The file store needs no setup/);
   });
 
-  it("never prints PostgreSQL passwords (fix 2026-09-27 #2), yet connects with the original string", async () => {
-    const secret = "REVIEW_FAKE_SECRET";
-    const dir = await project(
-      baseConfig({
-        graph: { checkpoint: { type: "postgres", connectionString: "${DATABASE_URL}" } },
-      }),
-    );
-    const env = { DATABASE_URL: `postgres://review:${secret}@localhost/review?password=${secret}` };
-    const connected: string[] = [];
-    const db = await pglite();
-    const loadPg = async (): Promise<PgModule> => ({
-      Pool: class {
-        constructor(options: { connectionString: string }) {
-          connected.push(options.connectionString);
+  it(
+    "never prints PostgreSQL passwords (fix 2026-09-27 #2), yet connects with the original string",
+    async () => {
+      const secret = "REVIEW_FAKE_SECRET";
+      const dir = await project(
+        baseConfig({
+          graph: { checkpoint: { type: "postgres", connectionString: "${DATABASE_URL}" } },
+        }),
+      );
+      const env = {
+        DATABASE_URL: `postgres://review:${secret}@localhost/review?password=${secret}`,
+      };
+      const connected: string[] = [];
+      const db = await pglite();
+      const loadPg = async (): Promise<PgModule> => ({
+        Pool: class {
+          constructor(options: { connectionString: string }) {
+            connected.push(options.connectionString);
+          }
+          query = db.query;
+          async end() {}
+        },
+      });
+      try {
+        const outputs: string[] = [];
+        for (const args of [
+          ["config", "--json"],
+          ["config"],
+          ["graph", "migrate"],
+          ["graph", "migrate", "--json"],
+          ["graph", "list"],
+          ["graph", "approvals"],
+          ["graph", "status", "missing"],
+          ["graph", "list", "--store", `postgres://review@localhost/review?Password=${secret}`],
+        ]) {
+          const { io } = fakeIO(dir, { env });
+          await runCli([...args, "--no-color"], io, { loadPg });
+          outputs.push(io.stdout.text + io.stderr.text);
         }
-        query = db.query;
-        async end() {}
-      },
-    });
-    try {
-      const outputs: string[] = [];
-      for (const args of [
-        ["config", "--json"],
-        ["config"],
-        ["graph", "migrate"],
-        ["graph", "migrate", "--json"],
-        ["graph", "list"],
-        ["graph", "approvals"],
-        ["graph", "status", "missing"],
-        ["graph", "list", "--store", `postgres://review@localhost/review?Password=${secret}`],
-      ]) {
-        const { io } = fakeIO(dir, { env });
-        await runCli([...args, "--no-color"], io, { loadPg });
-        outputs.push(io.stdout.text + io.stderr.text);
+        for (const output of outputs) expect(output).not.toContain(secret);
+        expect(JSON.parse(outputs[0] as string).config.graph.checkpoint.connectionString).toBe(
+          "postgres://review:***@localhost/review?password=***",
+        );
+        expect(outputs[1]).toMatch(/runs: postgres postgres:\/\/review:\*\*\*@localhost\/review/);
+        expect(outputs[2]).toMatch(
+          /Checkpoint tables are ready in postgres postgres:\/\/review:\*\*\*@/,
+        );
+        // The driver still received the real credentials.
+        expect(connected).toContain(env.DATABASE_URL);
+        expect(connected).toContain(`postgres://review@localhost/review?Password=${secret}`);
+      } finally {
+        await db.close();
       }
-      for (const output of outputs) expect(output).not.toContain(secret);
-      expect(JSON.parse(outputs[0] as string).config.graph.checkpoint.connectionString).toBe(
-        "postgres://review:***@localhost/review?password=***",
-      );
-      expect(outputs[1]).toMatch(/runs: postgres postgres:\/\/review:\*\*\*@localhost\/review/);
-      expect(outputs[2]).toMatch(
-        /Checkpoint tables are ready in postgres postgres:\/\/review:\*\*\*@/,
-      );
-      // The driver still received the real credentials.
-      expect(connected).toContain(env.DATABASE_URL);
-      expect(connected).toContain(`postgres://review@localhost/review?Password=${secret}`);
-    } finally {
-      await db.close();
-    }
-  });
+    },
+    PGLITE_TIMEOUT_MS,
+  );
 
   it("keeps masking provider keys and other secret-named values", async () => {
     const dir = await project(
@@ -720,85 +730,87 @@ describe("umio graph", () => {
     }
   });
 
-  it("lists old approvals and recovery runs behind 1 000 newer runs on PostgreSQL (fix 2026-09-27 #3)", async () => {
-    const dir = await project();
-    const db = await pglite();
-    const loadPg = async (): Promise<PgModule> => ({
-      Pool: class {
-        query = db.query;
-        async end() {}
-      },
-    });
-    const store = ["--store", "postgres://umio@localhost/umio"];
-    const cli = async (args: string[]) => {
-      const { io } = fakeIO(dir);
-      const code = await runCli([...args, ...store, "--no-color"], io, { loadPg });
-      return { code, out: io.stdout.text };
-    };
-    try {
-      expect((await cli(["graph", "migrate"])).code).toBe(0);
-      const base = {
-        schemaVersion: 2,
-        workflowId: "wf",
-        definitionVersion: "1",
-        definitionHash: "h",
-        input: null,
-        edges: {},
-        revision: 0,
-        createdAt: 1,
-      };
-      const gate = (runId: string) => ({
-        gate: {
-          nodeId: "gate",
-          status: "waiting",
-          attempt: 0,
-          approval: {
-            requestId: `q-${runId}`,
-            requestedAt: 1,
-            title: "Go?",
-            context: [],
-            onReject: "fail",
-          },
+  it(
+    "lists old approvals and recovery runs behind 1 000 newer runs on PostgreSQL (fix 2026-09-27 #3)",
+    async () => {
+      const dir = await project();
+      const db = await pglite();
+      const loadPg = async (): Promise<PgModule> => ({
+        Pool: class {
+          query = db.query;
+          async end() {}
         },
       });
-      const insert = (record: Record<string, unknown>) =>
-        db.query(
-          `INSERT INTO umio_runs (run_id, instance, record, schema_version, workflow_id, status, revision,
+      const store = ["--store", "postgres://umio@localhost/umio"];
+      const cli = async (args: string[]) => {
+        const { io } = fakeIO(dir);
+        const code = await runCli([...args, ...store, "--no-color"], io, { loadPg });
+        return { code, out: io.stdout.text };
+      };
+      try {
+        expect((await cli(["graph", "migrate"])).code).toBe(0);
+        const base = {
+          schemaVersion: 2,
+          workflowId: "wf",
+          definitionVersion: "1",
+          definitionHash: "h",
+          input: null,
+          edges: {},
+          revision: 0,
+          createdAt: 1,
+        };
+        const gate = (runId: string) => ({
+          gate: {
+            nodeId: "gate",
+            status: "waiting",
+            attempt: 0,
+            approval: {
+              requestId: `q-${runId}`,
+              requestedAt: 1,
+              title: "Go?",
+              context: [],
+              onReject: "fail",
+            },
+          },
+        });
+        const insert = (record: Record<string, unknown>) =>
+          db.query(
+            `INSERT INTO umio_runs (run_id, instance, record, schema_version, workflow_id, status, revision,
                                   created_at, updated_at)
            VALUES ($1, 'i', $2::json, 2, 'wf', $3, 0, 1, $4)`,
-          [record.runId, JSON.stringify(record), record.status, record.updatedAt],
-        );
-      await insert({
-        ...base,
-        runId: "old-paused",
-        status: "paused",
-        updatedAt: 2,
-        nodes: gate("old-paused"),
-      });
-      await insert({
-        ...base,
-        runId: "old-running",
-        status: "running",
-        updatedAt: 3,
-        nodes: gate("old-running"),
-      });
-      await insert({
-        ...base,
-        runId: "old-recovery",
-        status: "needs-recovery",
-        updatedAt: 4,
-        nodes: {
-          ...gate("old-recovery"),
-          work: {
-            nodeId: "work",
-            status: "uncertain",
-            attempt: 1,
-            uncertainReason: "process-lost",
+            [record.runId, JSON.stringify(record), record.status, record.updatedAt],
+          );
+        await insert({
+          ...base,
+          runId: "old-paused",
+          status: "paused",
+          updatedAt: 2,
+          nodes: gate("old-paused"),
+        });
+        await insert({
+          ...base,
+          runId: "old-running",
+          status: "running",
+          updatedAt: 3,
+          nodes: gate("old-running"),
+        });
+        await insert({
+          ...base,
+          runId: "old-recovery",
+          status: "needs-recovery",
+          updatedAt: 4,
+          nodes: {
+            ...gate("old-recovery"),
+            work: {
+              nodeId: "work",
+              status: "uncertain",
+              attempt: 1,
+              uncertainReason: "process-lost",
+            },
           },
-        },
-      });
-      await db.query(
-        `INSERT INTO umio_runs (run_id, instance, record, schema_version, workflow_id, status, revision,
+        });
+        await db.query(
+          `INSERT INTO umio_runs (run_id, instance, record, schema_version, workflow_id, status, revision,
                                 created_at, updated_at)
          SELECT 'done-' || i, 'i', json_build_object('schemaVersion', 1, 'runId', 'done-' || i,
                   'workflowId', 'wf', 'definitionVersion', '1', 'definitionHash', 'h',
@@ -806,27 +818,29 @@ describe("umio graph", () => {
                   'revision', 0, 'createdAt', 0, 'updatedAt', 1000 + i),
                 1, 'wf', 'completed', 0, 0, 1000 + i
          FROM generate_series(1, 1000) AS i`,
-      );
+        );
 
-      const approvals = await cli(["graph", "approvals", "--json"]);
-      expect(approvals.code).toBe(0);
-      expect(JSON.parse(approvals.out).map((item: { runId: string }) => item.runId)).toEqual([
-        "old-recovery",
-        "old-running",
-        "old-paused",
-      ]);
-      const recovery = await cli(["graph", "list", "--needs-recovery", "--json"]);
-      expect(JSON.parse(recovery.out).map((item: { runId: string }) => item.runId)).toEqual([
-        "old-recovery",
-      ]);
-      const all = await cli(["graph", "list", "--json"]);
-      expect(JSON.parse(all.out)).toHaveLength(1_003);
-      const direct = await cli(["graph", "approvals", "old-paused", "--json"]);
-      expect(JSON.parse(direct.out)).toMatchObject([{ runId: "old-paused", nodeId: "gate" }]);
-    } finally {
-      await db.close();
-    }
-  }, 60_000);
+        const approvals = await cli(["graph", "approvals", "--json"]);
+        expect(approvals.code).toBe(0);
+        expect(JSON.parse(approvals.out).map((item: { runId: string }) => item.runId)).toEqual([
+          "old-recovery",
+          "old-running",
+          "old-paused",
+        ]);
+        const recovery = await cli(["graph", "list", "--needs-recovery", "--json"]);
+        expect(JSON.parse(recovery.out).map((item: { runId: string }) => item.runId)).toEqual([
+          "old-recovery",
+        ]);
+        const all = await cli(["graph", "list", "--json"]);
+        expect(JSON.parse(all.out)).toHaveLength(1_003);
+        const direct = await cli(["graph", "approvals", "old-paused", "--json"]);
+        expect(JSON.parse(direct.out)).toMatchObject([{ runId: "old-paused", nodeId: "gate" }]);
+      } finally {
+        await db.close();
+      }
+    },
+    PGLITE_TIMEOUT_MS,
+  );
 
   it("filters the file store the same way", async () => {
     const dir = await project();

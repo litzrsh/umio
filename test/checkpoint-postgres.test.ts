@@ -6,13 +6,13 @@ import {
   type WorkflowRun,
 } from "../src/index.js";
 import { checkpointStoreContract } from "./checkpoint-contract.js";
-import { pglite, uniquePrefix } from "./support/postgres.js";
+import { PGLITE_TIMEOUT_MS, pglite, uniquePrefix } from "./support/postgres.js";
 
 let db: Awaited<ReturnType<typeof pglite>>;
 
 beforeAll(async () => {
   db = await pglite();
-});
+}, PGLITE_TIMEOUT_MS);
 afterAll(async () => {
   await db?.close();
 });

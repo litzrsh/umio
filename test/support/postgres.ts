@@ -12,6 +12,13 @@ import type { SqlClient } from "../../src/index.js";
 
 export const POSTGRES_URL = process.env.UMIO_TEST_POSTGRES_URL;
 
+/**
+ * Timeout for tests and hooks that start PGlite. Loading PostgreSQL as
+ * WebAssembly takes about a second locally but several on a shared CI runner,
+ * well past Vitest's 5 s default for a test that also runs a dozen CLI calls.
+ */
+export const PGLITE_TIMEOUT_MS = 60_000;
+
 /** A PGlite database as a `SqlClient`: parameterless multi-statement scripts go through `exec`. */
 export async function pglite(): Promise<SqlClient & { close(): Promise<void> }> {
   const db = await PGlite.create();
