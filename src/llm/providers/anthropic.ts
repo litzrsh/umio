@@ -71,6 +71,8 @@ export class AnthropicProvider implements LLMProvider {
           yield { type: "text-delta", text: event.delta.text };
         }
       }
+      // The SDK ends the iteration quietly on abort; a partial message is not a result.
+      if (request.signal?.aborted) throw new Anthropic.APIUserAbortError();
       message = await stream.finalMessage();
     } catch (error) {
       throw toLLMError(error);

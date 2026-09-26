@@ -545,9 +545,13 @@ describe("agentNode", () => {
       },
     );
 
-    const record = await executor({
-      onNodeEvent: (_id: string, _attempt: number, event: NodeEvent) => events.push(event),
-    }).run(def, "Write about caching.");
+    const record = await executor().run(def, "Write about caching.", {
+      observer: {
+        emit: (event) => {
+          if (event.type === "node-event") events.push(event.event);
+        },
+      },
+    });
 
     expect(record.status).toBe("completed");
     expect(record.nodes.polish?.output).toEqual({

@@ -454,12 +454,17 @@ describe("WorkflowExecutor (sequential behavior)", () => {
         },
       },
     );
-    const run = await executor({
-      onNodeEvent: (nodeId: string, attempt: number, event: { name?: string }) => {
-        if (event.name === "boom") throw new Error("observer broke");
-        events.push([nodeId, attempt, event]);
+    const run = await executor().run(def, null, {
+      observer: {
+        emit: (event) => {
+          if (event.type !== "node-event") return;
+          if (event.event.type === "custom" && event.event.name === "boom") {
+            throw new Error("observer broke");
+          }
+          events.push([event.nodeId, event.attempt, event.event]);
+        },
       },
-    }).run(def, null);
+    });
     expect(run.status).toBe("completed");
     expect(events).toEqual([["a", 1, { type: "custom", name: "progress", data: 1 }]]);
   });

@@ -132,7 +132,7 @@ export function decideEdges(
 /** W1: the attempt is recorded before the handler is invoked. */
 export function startAttempt(run: WorkflowRun, nodeId: NodeId, now: number): WorkflowRun {
   const node = requireNode(run, nodeId);
-  const { retryAt: _, ...rest } = node;
+  const { retryAt: _, error: __, ...rest } = node;
   return bump(
     withNode(run, { ...rest, status: "running", attempt: node.attempt + 1, startedAt: now }),
     now,
@@ -181,10 +181,54 @@ export function failNode(
   return bump(withNode(run, { ...node, status: "failed", error, finishedAt: now }), now);
 }
 
+/** W3 (retry): the node waits for `retryAt`, keeping the error that caused the retry. */
+export function retryNode(
+  run: WorkflowRun,
+  nodeId: NodeId,
+  error: NodeError,
+  retryAt: number,
+  now: number,
+): WorkflowRun {
+  const node = requireNode(run, nodeId);
+  return bump(withNode(run, { ...pendingAgain(node, retryAt), error }), now);
+}
+
+/**
+ * W4 (abandoned): an attempt that did not stop within the grace period after
+ * a timeout, cancel or run failure. Its outcome is unknown, so the node becomes
+ * `uncertain`; with `recovery: "retry"` and attempts left it waits for
+ * `now + retryDelayMs` instead. The run is parked later (W5′), once nothing runs.
+ */
+export function abandonAttempt(
+  graph: WorkflowGraph,
+  run: WorkflowRun,
+  nodeId: NodeId,
+  reason: NonNullable<NodeRun["uncertainReason"]>,
+  retryDelayMs: number,
+  now: number,
+): WorkflowRun {
+  const node = requireNode(run, nodeId);
+  const spec = requireSpec(graph, nodeId);
+  return bump(
+    withNode(
+      run,
+      spec.recovery === "retry" && node.attempt < (spec.retry?.maxAttempts ?? 1)
+        ? pendingAgain(node, now + retryDelayMs)
+        : { ...node, status: "uncertain", uncertainReason: reason, finishedAt: now },
+    ),
+    now,
+  );
+}
+
 /** W4: an attempt stopped because the run is failing or being cancelled. */
 export function cancelAttempt(run: WorkflowRun, nodeId: NodeId, now: number): WorkflowRun {
   const node = requireNode(run, nodeId);
   return bump(withNode(run, { ...node, status: "cancelled", finishedAt: now }), now);
+}
+
+/** W5′: the run waits for `recoverNode()`; no attempt starts while a node is uncertain. */
+export function parkRun(run: WorkflowRun, now: number): WorkflowRun {
+  return bump({ ...run, status: "needs-recovery" }, now);
 }
 
 /** W5: the run's terminal status. */
@@ -316,6 +360,24 @@ export function firstFailedNode(
   return undefined;
 }
 
+/** The earliest `retryAt` still in the future among pending nodes, if any. */
+export function nextRetryAt(run: WorkflowRun, now: number): number | undefined {
+  let next: number | undefined;
+  for (const node of Object.values(run.nodes)) {
+    if (node.status === "pending" && node.retryAt !== undefined && node.retryAt > now) {
+      next = next === undefined ? node.retryAt : Math.min(next, node.retryAt);
+    }
+  }
+  return next;
+}
+
+/** Nodes that became `skipped` between two versions of a record. */
+export function newlySkipped(before: WorkflowRun, after: WorkflowRun): NodeId[] {
+  return Object.values(after.nodes)
+    .filter((node) => node.status === "skipped" && before.nodes[node.nodeId]?.status !== "skipped")
+    .map((node) => node.nodeId);
+}
+
 /** True when every node is completed or skipped. */
 export function allNodesDone(run: WorkflowRun): boolean {
   return Object.values(run.nodes).every(
@@ -347,13 +409,13 @@ function propagateSkips(graph: WorkflowGraph, run: WorkflowRun, now: number): Wo
   return next;
 }
 
-/** A node made ready to start again; its attempt count and recoveries are kept. */
-function pendingAgain(node: NodeRun, now: number): NodeRun {
+/** A node made ready to start again at `retryAt`; its attempt count and recoveries are kept. */
+function pendingAgain(node: NodeRun, retryAt: number): NodeRun {
   return {
     nodeId: node.nodeId,
     status: "pending",
     attempt: node.attempt,
-    retryAt: now,
+    retryAt,
     ...(node.selectedPredecessor !== undefined && {
       selectedPredecessor: node.selectedPredecessor,
     }),
@@ -361,7 +423,7 @@ function pendingAgain(node: NodeRun, now: number): NodeRun {
   };
 }
 
-function hasUncertain(run: WorkflowRun): boolean {
+export function hasUncertain(run: WorkflowRun): boolean {
   return Object.values(run.nodes).some((node) => node.status === "uncertain");
 }
 

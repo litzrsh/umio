@@ -112,6 +112,28 @@ describe("AnthropicProvider", () => {
     expect(betaStream).toHaveBeenCalledOnce();
   });
 
+  it("rejects with an abort error when the SDK ends the stream quietly on abort", async () => {
+    const controller = new AbortController();
+    const { client, finalMessage } = fakeClient(toolUseResponse, [
+      { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Par" } },
+    ]);
+    const provider = new AnthropicProvider({ type: "anthropic", apiKey: "k" }, client);
+    const events: unknown[] = [];
+    const iterate = async () => {
+      for await (const event of provider.stream({
+        model: "claude-opus-5",
+        messages: [],
+        signal: controller.signal,
+      })) {
+        events.push(event);
+        controller.abort();
+      }
+    };
+    await expect(iterate()).rejects.toMatchObject({ message: "Request aborted." });
+    expect(events).toHaveLength(1);
+    expect(finalMessage).not.toHaveBeenCalled();
+  });
+
   it("streams text deltas, then tool calls, then the final result", async () => {
     const { client } = fakeClient(toolUseResponse, [
       { type: "message_start", message: {} },

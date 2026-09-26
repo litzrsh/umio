@@ -66,6 +66,8 @@ export class OpenAIProvider implements LLMProvider {
         const text = accumulator.add(chunk);
         if (text) yield { type: "text-delta", text };
       }
+      // The SDK ends the iteration quietly on abort; a partial completion is not a result.
+      if (request.signal?.aborted) throw new OpenAI.APIUserAbortError();
     } catch (error) {
       throw toLLMError(error, this.type);
     }

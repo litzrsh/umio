@@ -28,9 +28,11 @@
 
 - **Built-in tools** for files, the web, command-line programs, SQL databases and utilities, each with safe defaults and configurable per project in JSON.
 
+- **Graph workflows.** Branches, parallel nodes and joins, with retries, node timeouts, cancellation and observers. Every step is checkpointed, so a run survives a crash: completed nodes never re-run, and nodes whose outcome is unknown wait for an explicit recovery decision. Sized for local models where one call takes hours.
+
 **Planned**
 
-- State-graph workflows.
+- Graph workflows: pause and approval, loops, a database-backed checkpoint store.
 
 ---
 
@@ -124,6 +126,21 @@ Set `"local": true` or `false` to override the classification. Hosted gateways s
 `llm.requestStats()` reports in-flight and waiting requests per provider.
 
 **Behavior change for existing configs:** local providers now default to no retries and one request at a time. To restore the previous behavior, set `maxRetries` and `maxConcurrentRequests` explicitly.
+
+**Time limits for long local runs.** Each layer limits something different, and they are sized so that the graph node timeout is what ends a long call:
+
+| Limit | What it limits | Default |
+|---|---|---|
+| Node timeout (`graph.nodeTimeoutMs`, per-node `timeoutMs`) | One graph node attempt, wall clock, including time spent waiting for a request slot | 3 h |
+| Provider `timeoutMs` | One HTTP request, from sending it to its response headers | Local: 3 h 5 min |
+| `transport.headersTimeoutMs` / `bodyTimeoutMs` | Node's `fetch`: time to headers, and gaps between body chunks | Local: equal to `timeoutMs` |
+| Inactivity timeout (per-node `inactivityTimeoutMs`) | Time without progress events | Off |
+| Lease (`graph.leaseTtlMs`, renewed every `leaseRenewIntervalMs`) | Proof that the executor process is alive; not a limit on node duration | 30 s, renewed every 10 s |
+| Tool-loop `maxSteps`, built-in tool timeouts | Model calls per loop; one tool call | Unchanged |
+
+- `WorkflowExecutor.fromConfig()` and `agentNode()` emit a process warning (`UMIO_PROVIDER_TIMEOUT_BELOW_NODE_TIMEOUT`) when a local provider's request timeout is below the node timeout, since the provider would then end long calls first.
+- Recommended for one local model: `stream: true` on agent nodes (bytes keep flowing and progress is reported), and `"graph": { "maxConcurrency": 1 }`, so graph nodes don't wait behind each other's calls and use up their node timeouts.
+- Avoid CPU-bound work inside handlers. Inference runs in the model server, but a JavaScript event loop blocked for more than about 20 s misses lease renewals, and the run is then taken away from the executor.
 
 ### Models
 
@@ -385,9 +402,9 @@ Files are read as `NNNN-*.md`. The status comes from a `## Status` section or a 
 
 ---
 
-### Graph workflows (in progress)
+### Graph workflows
 
-`WorkflowExecutor` runs a directed acyclic graph of nodes: branches, parallel paths and joins. It is being built in phases (see `docs/work/umio-graph-workflow-plan.md`). Every change to a run is checkpointed to a `CheckpointStore`, and an interrupted run can be resumed by another process. **Retries, timeouts, the full cancel flow and observers come in a later phase.**
+`WorkflowExecutor` runs a directed acyclic graph of nodes: branches, parallel paths and joins, with retries, timeouts and cancellation. Every change to a run is checkpointed to a `CheckpointStore`, and an interrupted run can be resumed by another process. The design and its invariants are in `docs/work/umio-graph-workflow-plan.md`.
 
 ```typescript
 import { agentNode, WorkflowExecutor, type WorkflowDefinition } from "umio";
@@ -420,7 +437,7 @@ const definition: WorkflowDefinition = {
 };
 
 const run = await WorkflowExecutor.fromConfig(llm.config).run(definition, "Review this plan: …");
-run.status;               // "completed" | "failed"
+run.status;               // "completed" | "failed" | "cancelled" | "needs-recovery"
 run.nodes.merge?.output;  // { text, usage } from agentNode
 ```
 
@@ -443,9 +460,32 @@ run.nodes.merge?.output;  // { text, usage } from agentNode
 - Use `1` for a single local model.
 - It does not limit model calls made inside a node; the provider's `maxConcurrentRequests` does.
 
-**Failures**
+**Failures and retries**
 - A handler error is recorded on the node, and the run resolves with status `failed`, not an exception.
 - The other running nodes are aborted and recorded as `cancelled`, and nothing new starts.
+- A node with `retry: { maxAttempts, initialDelayMs, maxDelayMs?, multiplier? }` is retried after **retryable** errors: `GraphNodeError` with `retryable: true`, an `LLMError` the provider marked retryable, or a timeout. The wait is random between 0 and `initialDelayMs × multiplier^(attempt − 1)` (full jitter; `multiplier` defaults to 2, capped by `maxDelayMs`). Other nodes keep running meanwhile, and the wait is checkpointed, so a resumed run honors it.
+- The default is one attempt. Every attempt receives the same `idempotencyKey`.
+
+**Time limits**
+- Each attempt has a wall-clock **node timeout**: 3 h by default (`nodeTimeoutMs` on the executor or in the config's `graph` section), `timeoutMs` per node, `null` for none. `context.deadline` tells the handler when it ends.
+- `inactivityTimeoutMs` (per node, off by default) limits the time between progress events (`context.emit`, which `agentNode` calls for every agent event). Keep it off or generous for local models: a long prompt prefill emits nothing.
+- On expiry the attempt's `signal` aborts and the attempt fails with a retryable `timeout` error; a result that arrives after that is discarded.
+- **A handler that ignores its signal** is given `cancelGraceMs` (10 s) to stop, then **abandoned**: its node becomes `uncertain` (see below), because umio cannot know what it did, and nothing new starts. The run parks as `needs-recovery` once the other running nodes finish. JavaScript cannot be stopped from outside, so the abandoned promise keeps running in the background and its result is ignored. Handlers doing long work must honor `context.signal`.
+- The lease and the cancel poll run on their own timers, so none of these limits depends on whether the model is producing output.
+
+**Cancellation**
+- `executor.cancel(runId)` works from any executor sharing the store, and returns a `CancelAck`:
+  - `requested`: recorded; the live owner notices within 2 s (`cancelPollIntervalMs`), aborts running nodes and ends the run `cancelled`;
+  - `cancelled`: nobody owned the run (its owner crashed and its lease expired, or it was parked), so this call finalized it; nodes left running become `uncertain`;
+  - `already-terminal` or `not-found`.
+- Aborting `GraphRunOptions.signal` cancels the run the same way.
+- Nodes that stop within `cancelGraceMs` are recorded `cancelled`; the others are abandoned and become `uncertain`. The run is `cancelled` either way, and `run()` resolves without waiting for abandoned handlers.
+- A failure and a cancel never both apply: whichever the executor processes first decides the run's status.
+
+**Observers**
+- `run(definition, input, { observer, onObserverError })` delivers events in order: `run-start`/`run-resume`, `node-start`, `node-event` (from `context.emit`), `node-retry`, `node-finish` (with its status, including `skipped`), `run-cancel-requested`, then `run-finish` or `run-needs-recovery`.
+- Delivery is queued: the scheduler never waits for the observer, and an observer that throws or hangs changes neither the run nor its timing. Errors go to `onObserverError`.
+- When the run ends, its status is persisted and its lease released first; then `run()` waits at most `observerDrainTimeoutMs` (5 s) for queued events. Events not delivered by then are dropped, never the status.
 
 **Outputs**
 - Outputs must be JSON and at most `maxOutputBytes` (default 256 KiB; configurable per executor, per node, or in the config's `graph` section).
@@ -455,7 +495,6 @@ run.nodes.merge?.output;  // { text, usage } from agentNode
 - Pass `store` to the executor; the default is an in-memory `MemoryCheckpointStore` per executor. A node's attempt is recorded before its handler runs, and its successors start only after its result is recorded.
 - The executor holds a **lease** on each run it owns (30 s, renewed every 10 s on its own timer), so a model call that is silent for hours never looks like a dead executor. Every write is a compare-and-swap fenced by that lease: once another owner could have taken over, the old one cannot write.
 - If the lease is lost, the executor aborts running nodes, writes nothing more and rejects with `LeaseLostError`. A write that conflicts under a valid lease rejects with `CheckpointConflictError`.
-- `store.requestCancel(runId)` asks the owner to stop. It notices within 2 s (`cancelPollIntervalMs`), aborts running nodes, starts nothing new and ends the run `cancelled`. A handler that ignores its signal is still waited for, for now.
 - Custom stores implement `CheckpointStore` and should pass the contract suite in `test/checkpoint-contract.ts`. umio never claims exactly-once execution: use `idempotencyKey` to deduplicate side effects.
 - `FileCheckpointStore.open({ dir })` keeps runs on disk so they survive a restart. It is **experimental and single-process only**: never share its directory between processes. It refuses to open a directory another live process is using.
 

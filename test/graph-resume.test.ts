@@ -6,11 +6,8 @@
  */
 import { describe, expect, it } from "vitest";
 import {
-  type CasResult,
-  type CheckpointStore,
   DefinitionMismatchError,
   type JsonValue,
-  type Lease,
   LeaseUnavailableError,
   MemoryCheckpointStore,
   type NodeContext,
@@ -21,60 +18,11 @@ import {
   RunNotResumableError,
   type WorkflowDefinition,
   WorkflowExecutor,
-  type WorkflowRun,
 } from "../src/index.js";
 import { FakeClock, settle } from "./support/fake-clock.js";
+import { ProcessStore } from "./support/graph.js";
 
 const never = <T>() => new Promise<T>(() => {});
-
-class ProcessStore implements CheckpointStore {
-  crashed = false;
-  /** Crash right after a successful write that matches. */
-  crashAfterWrite?: (run: WorkflowRun) => boolean;
-
-  constructor(private readonly inner: CheckpointStore) {}
-
-  crash() {
-    this.crashed = true;
-  }
-
-  private call<T>(operation: () => Promise<T>): Promise<T> {
-    if (this.crashed) return never();
-    return operation().then((value) => (this.crashed ? never<T>() : value));
-  }
-
-  create(run: WorkflowRun, ownerId: string, ttlMs: number) {
-    return this.call(() => this.inner.create(run, ownerId, ttlMs));
-  }
-  load(runId: string) {
-    return this.call(() => this.inner.load(runId));
-  }
-  compareAndSwap(run: WorkflowRun, expected: number, lease: Lease) {
-    return this.call(async (): Promise<CasResult> => {
-      const result = await this.inner.compareAndSwap(run, expected, lease);
-      if (result === "ok" && this.crashAfterWrite?.(run)) this.crash();
-      return result;
-    });
-  }
-  acquireLease(runId: string, ownerId: string, ttlMs: number) {
-    return this.call(() => this.inner.acquireLease(runId, ownerId, ttlMs));
-  }
-  renewLease(lease: Lease, ttlMs: number) {
-    return this.call(() => this.inner.renewLease(lease, ttlMs));
-  }
-  releaseLease(lease: Lease) {
-    return this.call(() => this.inner.releaseLease(lease));
-  }
-  requestCancel(runId: string) {
-    return this.call(() => this.inner.requestCancel(runId));
-  }
-  isCancelRequested(runId: string) {
-    return this.call(() => this.inner.isCancelRequested(runId));
-  }
-  delete(runId: string) {
-    return this.call(() => this.inner.delete(runId));
-  }
-}
 
 /** Handlers for a → b → c that count calls and record their contexts. */
 function counted(overrides: Record<string, NodeHandler> = {}) {

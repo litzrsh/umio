@@ -123,7 +123,8 @@ export const AdrConfigSchema = z
 
 /**
  * Settings for `WorkflowExecutor.fromConfig`. Explicit constructor and run
- * options take precedence. Fields are added as the executor implements them.
+ * options take precedence. The executor checks how the lease, poll and grace
+ * settings relate to each other when it is created.
  */
 export const GraphConfigSchema = z
   .object({
@@ -131,6 +132,18 @@ export const GraphConfigSchema = z
     maxConcurrency: z.number().int().positive().optional(),
     /** Largest checkpointed node output in bytes. Default 262144 (256 KiB). */
     maxOutputBytes: z.number().int().positive().optional(),
+    /** Wall-clock limit per node attempt. Default 10800000 (3 h); null disables it. */
+    nodeTimeoutMs: z.number().int().positive().nullable().optional(),
+    /** How long a lease stays valid without renewal. Default 30000. */
+    leaseTtlMs: z.number().int().positive().optional(),
+    /** How often the lease is renewed; below half of leaseTtlMs. Default 10000. */
+    leaseRenewIntervalMs: z.number().int().positive().optional(),
+    /** How often the owner checks for cancel requests; below leaseTtlMs. Default 2000. */
+    cancelPollIntervalMs: z.number().int().positive().optional(),
+    /** How long a stopped attempt may take to finish before it is abandoned; below leaseTtlMs. Default 10000. */
+    cancelGraceMs: z.number().int().nonnegative().optional(),
+    /** How long a finished run waits for observers to receive queued events. Default 5000. */
+    observerDrainTimeoutMs: z.number().int().nonnegative().optional(),
   })
   .strict();
 

@@ -13,8 +13,10 @@ import {
   RunNotResumableError,
 } from "./errors.js";
 import { definitionHash } from "./identity.js";
+import { ObserverQueue } from "./observer.js";
 import { checkOutput } from "./output.js";
 import {
+  abandonAttempt,
   allNodesDone,
   applyRecovery,
   cancelAttempt,
@@ -25,31 +27,45 @@ import {
   finalizeCancel,
   finishRun,
   firstFailedNode,
+  hasUncertain,
+  newlySkipped,
+  nextRetryAt,
   orphanedNodes,
+  parkRun,
   predecessorOutputs,
   readyNodes,
   recoverOrphans,
+  retryNode,
   startAttempt,
 } from "./plan.js";
+import { retryDelay, shouldRetry } from "./retry.js";
 import { type RuntimeDependencies, withDefaults } from "./runtime.js";
 import type {
+  CancelAck,
+  GraphRunEvent,
   JsonValue,
   NodeContext,
   NodeError,
   NodeEvent,
   NodeId,
+  NodeRun,
   RecoveryAction,
+  RunObserver,
   RunStatus,
   WorkflowDefinition,
   WorkflowRun,
 } from "./types.js";
 import { isJsonValue, validateDefinition } from "./validate.js";
+import { emitWarnings, shortProviderTimeouts } from "./warnings.js";
 
 export const DEFAULT_MAX_CONCURRENCY = 4;
 export const DEFAULT_MAX_OUTPUT_BYTES = 262_144;
+export const DEFAULT_NODE_TIMEOUT_MS = 10_800_000; // 3 h
 export const DEFAULT_LEASE_TTL_MS = 30_000;
 export const DEFAULT_LEASE_RENEW_INTERVAL_MS = 10_000;
 export const DEFAULT_CANCEL_POLL_INTERVAL_MS = 2_000;
+export const DEFAULT_CANCEL_GRACE_MS = 10_000;
+export const DEFAULT_OBSERVER_DRAIN_TIMEOUT_MS = 5_000;
 const MAX_ERROR_MESSAGE = 1_000;
 
 export interface WorkflowExecutorOptions {
@@ -67,46 +83,78 @@ export interface WorkflowExecutorOptions {
   /** Largest checkpointed node output, in UTF-8 bytes of JSON. Default 256 KiB. */
   maxOutputBytes?: number;
   /**
+   * Wall-clock limit per attempt, unless a node sets `timeoutMs`. Default 3 h;
+   * `null` disables it. On expiry the attempt's signal aborts; see `cancelGraceMs`.
+   */
+  nodeTimeoutMs?: number | null;
+  /**
    * How long a lease stays valid without renewal. Default 30 s: after a crash,
    * another executor can take over the run this long after the last renewal.
    */
   leaseTtlMs?: number;
-  /** How often the lease is renewed, on its own timer. Default 10 s; must be below `leaseTtlMs`. */
+  /** How often the lease is renewed, on its own timer. Default 10 s; must be below half of `leaseTtlMs`. */
   leaseRenewIntervalMs?: number;
-  /** How often the store is polled for a cancel request. Default 2 s. */
+  /** How often the store is polled for a cancel request. Default 2 s; must be below `leaseTtlMs`. */
   cancelPollIntervalMs?: number;
-  /** Receives node events (`context.emit`). Errors thrown by it are ignored. */
-  onNodeEvent?(nodeId: NodeId, attempt: number, event: NodeEvent): void;
+  /**
+   * How long an attempt may take to stop after its signal aborts (timeout,
+   * cancel or run failure) before it is abandoned and its node becomes
+   * `uncertain`. Default 10 s; must be below `leaseTtlMs`.
+   */
+  cancelGraceMs?: number;
+  /** How long a finished run waits for its observer to receive queued events. Default 5 s. */
+  observerDrainTimeoutMs?: number;
 }
 
 export interface GraphRunOptions {
   readonly runId?: string;
   /** Overrides the executor's `maxConcurrency` for this run. */
   readonly maxConcurrency?: number;
+  /** Aborting it cancels the run, like `cancel()`. */
+  readonly signal?: AbortSignal;
+  /** Receives run and node events, in order, without ever delaying the run. */
+  readonly observer?: RunObserver;
+  /** Called when the observer throws or rejects. Default: the error is dropped. */
+  readonly onObserverError?: (error: unknown, event: GraphRunEvent) => void;
 }
 
 type Outcome = { ok: true; output: JsonValue } | { ok: false; error: NodeError };
 
 type Halt = { kind: "failed"; nodeId: NodeId; error: NodeError } | { kind: "cancelled" };
 
+/** Why a running attempt was asked to stop. */
+type StopReason = "timeout" | "failed" | "cancelled";
+
 interface RunningAttempt {
   attempt: number;
   controller: AbortController;
   settled: Promise<{ nodeId: NodeId; attempt: number; outcome: Outcome }>;
+  /** Timers to cancel when the attempt settles or is abandoned. */
+  timers: (() => void)[];
+  stop?: { reason: StopReason; error: NodeError };
+  /** Set when the grace period after `stop` ran out. */
+  abandoned?: boolean;
+}
+
+interface DriveOptions {
+  maxConcurrency: number;
+  queue: ObserverQueue;
+  signal: AbortSignal | undefined;
 }
 
 /**
  * Runs workflow definitions: validation, definition identity, branching
- * (predicates), joins, skip propagation and bounded concurrency, checkpointing
- * every change to a `CheckpointStore`. Retries, timeouts, the full cancel flow
- * and resumption arrive in later phases (docs/work/umio-graph-workflow-plan.md).
+ * (predicates), joins, skip propagation, bounded concurrency, retries with
+ * backoff, node timeouts and cancellation, checkpointing every change to a
+ * `CheckpointStore` so another executor can resume the run after a crash.
  *
  * Every change to the run record goes through `commit()`, a compare-and-swap
  * fenced by this executor's lease (I1). Results are applied one at a time by
- * the scheduling loop, never from inside handler callbacks, so writes are
- * serialized even with concurrent nodes. The lease is renewed and the store
- * polled for cancel requests on timers of their own, independent of handler
- * activity, so a long silent model call never looks like a dead executor.
+ * the scheduling loop, never from inside handler or timer callbacks, so writes
+ * are serialized even with concurrent nodes. The lease is renewed, the store
+ * polled for cancel requests and node timeouts measured on timers of their
+ * own, independent of handler activity, so a long silent model call never
+ * looks like a dead executor.
  */
 export class WorkflowExecutor {
   private readonly deps: RuntimeDependencies;
@@ -115,14 +163,17 @@ export class WorkflowExecutor {
   private readonly ownerId: string;
   private readonly maxConcurrency: number;
   private readonly maxOutputBytes: number;
+  /** The node timeout applied when a node does not set `timeoutMs`. */
+  readonly nodeTimeoutMs: number | null;
   private readonly leaseTtlMs: number;
   private readonly leaseRenewIntervalMs: number;
   private readonly cancelPollIntervalMs: number;
+  private readonly cancelGraceMs: number;
+  private readonly observerDrainTimeoutMs: number;
+  /** Runs this executor is driving: run ID → notice a cancel request. */
+  private readonly active = new Map<string, () => void>();
 
-  constructor(
-    private readonly options: WorkflowExecutorOptions = {},
-    dependencies?: Partial<RuntimeDependencies>,
-  ) {
+  constructor(options: WorkflowExecutorOptions = {}, dependencies?: Partial<RuntimeDependencies>) {
     this.deps = withDefaults(dependencies);
     this.maxConcurrency = positiveInt(
       options.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY,
@@ -132,20 +183,31 @@ export class WorkflowExecutor {
       options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES,
       "maxOutputBytes",
     );
+    const nodeTimeoutMs =
+      options.nodeTimeoutMs === undefined ? DEFAULT_NODE_TIMEOUT_MS : options.nodeTimeoutMs;
+    this.nodeTimeoutMs =
+      nodeTimeoutMs === null ? null : positiveInt(nodeTimeoutMs, "nodeTimeoutMs");
     this.leaseTtlMs = positiveInt(options.leaseTtlMs ?? DEFAULT_LEASE_TTL_MS, "leaseTtlMs");
     this.leaseRenewIntervalMs = positiveInt(
       options.leaseRenewIntervalMs ?? DEFAULT_LEASE_RENEW_INTERVAL_MS,
       "leaseRenewIntervalMs",
     );
-    if (this.leaseRenewIntervalMs >= this.leaseTtlMs) {
-      throw new UmioError(
-        `leaseRenewIntervalMs (${this.leaseRenewIntervalMs}) must be below leaseTtlMs (${this.leaseTtlMs}).`,
-      );
-    }
     this.cancelPollIntervalMs = positiveInt(
       options.cancelPollIntervalMs ?? DEFAULT_CANCEL_POLL_INTERVAL_MS,
       "cancelPollIntervalMs",
     );
+    this.cancelGraceMs = nonNegativeInt(
+      options.cancelGraceMs ?? DEFAULT_CANCEL_GRACE_MS,
+      "cancelGraceMs",
+    );
+    this.observerDrainTimeoutMs = nonNegativeInt(
+      options.observerDrainTimeoutMs ?? DEFAULT_OBSERVER_DRAIN_TIMEOUT_MS,
+      "observerDrainTimeoutMs",
+    );
+    // Two renewals fit in one TTL; the poll and grace waits never outlive the lease (D12).
+    below(this.leaseRenewIntervalMs * 2, this.leaseTtlMs, "leaseRenewIntervalMs × 2");
+    below(this.cancelPollIntervalMs, this.leaseTtlMs, "cancelPollIntervalMs");
+    below(this.cancelGraceMs, this.leaseTtlMs, "cancelGraceMs");
     this.store = options.store ?? new MemoryCheckpointStore({ now: this.deps.now });
     this.ownerId = this.deps.newId();
   }
@@ -153,27 +215,36 @@ export class WorkflowExecutor {
   /**
    * Creates an executor from the config's `graph` section. Precedence, highest
    * first: `GraphRunOptions` → `options` here → the config file → built-in defaults.
+   *
+   * When the config has models and providers, a local provider whose request
+   * timeout is below the node timeout produces a process warning (D12).
    */
   static fromConfig(
-    config: Pick<UmioConfig, "graph">,
+    config: Pick<UmioConfig, "graph"> & Partial<Pick<UmioConfig, "models" | "providers">>,
     options: WorkflowExecutorOptions = {},
     dependencies?: Partial<RuntimeDependencies>,
   ): WorkflowExecutor {
-    const fromFile = config.graph ?? {};
-    return new WorkflowExecutor(
-      {
-        ...(fromFile.maxConcurrency !== undefined && { maxConcurrency: fromFile.maxConcurrency }),
-        ...(fromFile.maxOutputBytes !== undefined && { maxOutputBytes: fromFile.maxOutputBytes }),
-        ...definedOnly(options),
-      },
+    const executor = new WorkflowExecutor(
+      { ...definedOnly(config.graph ?? {}), ...definedOnly(options) },
       dependencies,
     );
+    if (config.models && config.providers) {
+      emitWarnings(
+        shortProviderTimeouts(
+          { models: config.models, providers: config.providers },
+          executor.nodeTimeoutMs,
+        ),
+      );
+    }
+    return executor;
   }
 
   /**
-   * Runs a definition to a terminal status. Resolves with the run record whether
-   * the run completed or failed (a node failure is data, not an exception);
-   * rejects only for invalid definitions, input or options.
+   * Runs a definition until it is terminal (`completed`, `failed`,
+   * `cancelled`) or parked (`needs-recovery`, after an abandoned attempt), and
+   * resolves with the run record: a node failure is data, not an exception.
+   * Rejects for invalid definitions, input or options, and when the executor
+   * cannot continue safely (lease lost, checkpoint conflict, store errors).
    */
   async run(
     definition: WorkflowDefinition,
@@ -195,7 +266,56 @@ export class WorkflowExecutor {
       now: this.deps.now(),
     });
     const lease = await this.store.create(initial, this.ownerId, this.leaseTtlMs); // W0
-    return this.drive(definition, initial, lease, maxConcurrency);
+    const queue = new ObserverQueue(options.observer, options.onObserverError);
+    queue.push({ type: "run-start", runId: initial.runId, at: this.deps.now() });
+    return this.drive(definition, initial, lease, {
+      maxConcurrency,
+      queue,
+      signal: options.signal,
+    });
+  }
+
+  /**
+   * Cancels a run, wherever it is owned (plan D10):
+   *
+   * - `requested`: the request is recorded, and the live owner (this executor
+   *   or another) stops the run within about `cancelPollIntervalMs`, plus up to
+   *   `cancelGraceMs` for handlers that ignore their abort signal.
+   * - `cancelled`: nobody owned the run (its owner crashed and its lease
+   *   expired, or it was parked), so this call finalized it: nodes left running
+   *   become `uncertain`, since their effects may have happened.
+   * - `already-terminal` or `not-found`: nothing to do.
+   */
+  async cancel(runId: string): Promise<CancelAck> {
+    try {
+      const record = await this.store.load(runId);
+      if (!record) return { runId, outcome: "not-found" };
+      if (isTerminal(record.status)) {
+        return { runId, outcome: "already-terminal", status: record.status };
+      }
+      await this.store.requestCancel(runId);
+      const local = this.active.get(runId);
+      if (local) {
+        local();
+        return { runId, outcome: "requested", status: record.status };
+      }
+      const lease = await this.store.acquireLease(runId, this.ownerId, this.leaseTtlMs);
+      if (!lease) return { runId, outcome: "requested", status: record.status };
+      try {
+        const current = await this.store.load(runId);
+        if (!current) return { runId, outcome: "not-found" };
+        if (isTerminal(current.status)) {
+          return { runId, outcome: "already-terminal", status: current.status };
+        }
+        await this.write(current, finalizeCancel(current, this.deps.now()), lease); // W7
+        return { runId, outcome: "cancelled", status: "cancelled" };
+      } finally {
+        await this.release(lease);
+      }
+    } catch (error) {
+      if (error instanceof RunNotFoundError) return { runId, outcome: "not-found" };
+      throw error;
+    }
   }
 
   /**
@@ -225,10 +345,14 @@ export class WorkflowExecutor {
       "maxConcurrency",
     );
     let { record, lease } = await this.takeOver(definition, runId, ["running", "needs-recovery"]);
+    const queue = new ObserverQueue(options.observer, options.onObserverError);
+    queue.push({ type: "run-resume", runId, at: this.deps.now() });
 
     if (await this.store.isCancelRequested(runId)) {
       record = await this.write(record, finalizeCancel(record, this.deps.now()), lease); // W7
       await this.release(lease);
+      queue.push({ type: "run-finish", runId, status: "cancelled", at: this.deps.now() });
+      await queue.drain(this.observerDrainTimeoutMs, this.deps);
       return record;
     }
     if (orphanedNodes(record).length > 0) {
@@ -240,9 +364,15 @@ export class WorkflowExecutor {
     }
     if (record.status === "needs-recovery") {
       await this.release(lease);
+      queue.push(needsRecoveryEvent(record, this.deps.now()));
+      await queue.drain(this.observerDrainTimeoutMs, this.deps);
       return record;
     }
-    return this.drive(definition, record, lease, maxConcurrency);
+    return this.drive(definition, record, lease, {
+      maxConcurrency,
+      queue,
+      signal: options.signal,
+    });
   }
 
   /**
@@ -372,27 +502,42 @@ export class WorkflowExecutor {
     }
   }
 
+  /** Whether a cancel request is recorded; a failed read counts as no (the poll retries). */
+  private async cancelPending(runId: string): Promise<boolean> {
+    try {
+      return await this.store.isCancelRequested(runId);
+    } catch {
+      return false;
+    }
+  }
+
   /**
-   * Owns a run until it is terminal: schedules nodes, applies their results and
-   * keeps the lease. Resolves with the terminal record. Rejects with
-   * `LeaseLostError` or `CheckpointConflictError` (or a store error) after
-   * aborting running attempts, stopping its timers and writing nothing more (I6).
+   * Owns a run until it is terminal or parked: schedules nodes, applies their
+   * results, retries, times out and abandons attempts, and keeps the lease.
+   * Rejects with `LeaseLostError` or `CheckpointConflictError` (or a store
+   * error) after aborting running attempts, stopping its timers and writing
+   * nothing more (I6).
+   *
+   * Shutdown order (D6): the terminal or parking write, then timers stop and
+   * the lease is released, then the observer queue drains, then it resolves.
    */
   private async drive(
     definition: WorkflowDefinition,
     initial: WorkflowRun,
     firstLease: Lease,
-    maxConcurrency: number,
+    { maxConcurrency, queue, signal }: DriveOptions,
   ): Promise<WorkflowRun> {
     const { graph } = definition;
     const { runId } = initial;
+    const now = () => this.deps.now();
     let record = initial;
     let lease = firstLease;
     const running = new Map<NodeId, RunningAttempt>();
-    // Set by the timers; acted on by the scheduling loop, which `wake` interrupts.
+    // Set by timers and callbacks; acted on by the scheduling loop, which `wake` interrupts.
     let fatal: Error | undefined;
     let cancelRequested = false;
     let wake = deferred();
+    let cancelRetryTimer = () => {};
     // A resumed run may already have a failed node (a crash before W5): finish it as failed.
     const failed = firstFailedNode(graph, initial);
     // (Asserted: closures assign it, which control-flow narrowing cannot see.)
@@ -402,24 +547,105 @@ export class WorkflowExecutor {
       if (fatal) throw fatal;
       record = await this.write(record, next, lease);
     };
+    const finished = (nodeId: NodeId, status: NodeFinishStatus) =>
+      queue.push({
+        type: "node-finish",
+        runId,
+        nodeId,
+        attempt: record.nodes[nodeId]?.attempt ?? 0,
+        status,
+        at: now(),
+      });
     const loseLease = () => {
       fatal ??= new LeaseLostError(runId);
       wake.resolve();
     };
-    const stopRunning = (reason: unknown) => {
-      for (const attempt of running.values()) attempt.controller.abort(reason);
+    const noticeCancel = () => {
+      if (cancelRequested) return;
+      cancelRequested = true;
+      queue.push({ type: "run-cancel-requested", runId, at: now() });
+      wake.resolve();
+    };
+    const clearTimers = (entry: RunningAttempt) => {
+      for (const stop of entry.timers.splice(0)) stop();
+    };
+    // Aborts an attempt's signal and gives it `cancelGraceMs` to settle before
+    // it is abandoned. The first reason wins.
+    const stopAttempt = (entry: RunningAttempt, reason: StopReason, error: NodeError) => {
+      if (entry.stop) return;
+      entry.stop = { reason, error };
+      entry.controller.abort(
+        reason === "timeout"
+          ? new GraphNodeError(error.message, { code: error.code, retryable: error.retryable })
+          : new UmioError(error.message),
+      );
+      entry.timers.push(
+        this.deps.setTimer(this.cancelGraceMs, () => {
+          entry.abandoned = true;
+          wake.resolve();
+        }),
+      );
     };
     const startHalt = (next: Halt) => {
       // The first decision wins (I9). Running attempts are asked to stop;
       // results that still arrive are recorded, but nothing new starts.
       halt = next;
-      stopRunning(
-        new UmioError(
-          next.kind === "failed"
-            ? `Run stopped: node "${next.nodeId}" failed.`
-            : `Run "${runId}" cancelled.`,
-        ),
-      );
+      const message =
+        next.kind === "failed"
+          ? `Run stopped: node "${next.nodeId}" failed.`
+          : `Run "${runId}" cancelled.`;
+      for (const entry of running.values()) {
+        stopAttempt(entry, next.kind, { code: next.kind, message, retryable: false });
+      }
+    };
+    /** Starts an attempt's handler and timers and adds it to `running`. */
+    const launch = (nodeId: NodeId, attempt: number): void => {
+      const spec = graph.nodes.find((node) => node.id === nodeId);
+      const startedAt = now();
+      const entry: RunningAttempt = {
+        attempt,
+        controller: new AbortController(),
+        timers: [],
+        // Assigned below: the handler's callbacks need `entry` to exist first.
+        settled: Promise.resolve() as never,
+      };
+      const timeoutMs = spec?.timeoutMs === undefined ? this.nodeTimeoutMs : spec.timeoutMs;
+      if (timeoutMs !== null) {
+        entry.timers.push(
+          this.deps.setTimer(timeoutMs, () =>
+            stopAttempt(entry, "timeout", timeoutError(nodeId, `timed out after ${timeoutMs} ms`)),
+          ),
+        );
+      }
+      // Inactivity: re-armed lazily for the remaining time, so frequent events cost nothing.
+      let lastProgress = startedAt;
+      const inactivityMs = spec?.inactivityTimeoutMs;
+      if (inactivityMs !== undefined) {
+        let cancel = () => {};
+        const arm = (ms: number) => {
+          cancel = this.deps.setTimer(ms, () => {
+            const idle = now() - lastProgress;
+            if (idle < inactivityMs) return arm(inactivityMs - idle);
+            stopAttempt(
+              entry,
+              "timeout",
+              timeoutError(nodeId, `made no progress for ${inactivityMs} ms`),
+            );
+          });
+        };
+        arm(inactivityMs);
+        entry.timers.push(() => cancel());
+      }
+      running.set(nodeId, entry); // before the handler runs, so its first events count
+      entry.settled = this.invoke(definition, record, nodeId, attempt, {
+        signal: entry.controller.signal,
+        ...(timeoutMs !== null && { deadline: startedAt + timeoutMs }),
+        onEvent: (event) => {
+          if (running.get(nodeId) !== entry) return; // abandoned or settled: no longer reported
+          lastProgress = now();
+          queue.push({ type: "node-event", runId, nodeId, attempt, event, at: lastProgress });
+        },
+      }).then((outcome) => ({ nodeId, attempt, outcome }));
     };
 
     const stopTimers = [
@@ -435,60 +661,119 @@ export class WorkflowExecutor {
         }
       }),
       repeat(this.deps, this.cancelPollIntervalMs, async () => {
-        try {
-          if (!cancelRequested && (await this.store.isCancelRequested(runId))) {
-            cancelRequested = true;
-            wake.resolve();
-          }
-        } catch {
-          // Polled again on the next tick.
-        }
+        if (!cancelRequested && (await this.cancelPending(runId))) noticeCancel();
       }),
     ];
     const stopAllTimers = () => {
       for (const stop of stopTimers) stop();
+      cancelRetryTimer();
     };
+    // A local abort is a cancel request; it is also recorded, so that it
+    // survives a crash before the run is finalized (I8).
+    const onAbort = () => {
+      noticeCancel();
+      this.store.requestCancel(runId).catch(() => {});
+    };
+    if (signal?.aborted) onAbort();
+    else signal?.addEventListener("abort", onAbort, { once: true });
+    this.active.set(runId, noticeCancel);
 
     try {
       for (;;) {
         if (fatal) throw fatal;
         if (cancelRequested && !halt) startHalt({ kind: "cancelled" });
 
-        if (!halt) {
-          for (const nodeId of readyNodes(graph, record, this.deps.now())) {
-            if (running.size >= maxConcurrency) break;
-            await commit(startAttempt(record, nodeId, this.deps.now())); // W1, before the handler
-            const attempt = record.nodes[nodeId]?.attempt ?? 1;
-            const controller = new AbortController();
-            running.set(nodeId, {
-              attempt,
-              controller,
-              settled: this.invoke(definition, record, nodeId, attempt, controller.signal).then(
-                (outcome) => ({ nodeId, attempt, outcome }),
-              ),
+        // Attempts whose grace period ran out: their outcome is unknown (W4, D13).
+        for (const [nodeId, entry] of [...running]) {
+          if (!entry.abandoned) continue;
+          running.delete(nodeId);
+          clearTimers(entry);
+          const spec = graph.nodes.find((node) => node.id === nodeId);
+          await commit(
+            abandonAttempt(
+              graph,
+              record,
+              nodeId,
+              abandonReason(entry.stop?.reason),
+              retryDelay(spec?.retry, entry.attempt, this.deps.random),
+              now(),
+            ),
+          );
+          const node = record.nodes[nodeId];
+          if (node?.status === "pending" && node.retryAt !== undefined) {
+            queue.push({
+              type: "node-retry",
+              runId,
+              nodeId,
+              attempt: entry.attempt,
+              retryAt: node.retryAt,
+              at: now(),
             });
+          } else {
+            finished(nodeId, "uncertain");
           }
+        }
+
+        // No new attempts once the run is stopping or a node is uncertain (D13).
+        if (!halt && !hasUncertain(record)) {
+          for (const nodeId of readyNodes(graph, record, now())) {
+            if (running.size >= maxConcurrency || cancelRequested) break;
+            // The control record is read before every start, not only by the poll (D10).
+            if (await this.cancelPending(runId)) {
+              noticeCancel();
+              break;
+            }
+            await commit(startAttempt(record, nodeId, now())); // W1, before the handler
+            const attempt = record.nodes[nodeId]?.attempt ?? 1;
+            // Queued before the handler runs, so its own events follow this one.
+            queue.push({ type: "node-start", runId, nodeId, attempt, at: now() });
+            launch(nodeId, attempt);
+          }
+          if (cancelRequested && !halt) continue;
         }
 
         if (running.size === 0) {
           if (halt?.kind === "failed") {
             await commit(
-              finishRun(record, "failed", this.deps.now(), {
+              finishRun(record, "failed", now(), {
                 code: halt.error.code,
                 message: halt.error.message,
                 nodeId: halt.nodeId,
               }),
             );
           } else if (halt?.kind === "cancelled") {
-            await commit(finishRun(record, "cancelled", this.deps.now()));
+            await commit(finishRun(record, "cancelled", now()));
+          } else if (hasUncertain(record)) {
+            await commit(parkRun(record, now())); // W5′
           } else if (allNodesDone(record)) {
-            await commit(finishRun(record, "completed", this.deps.now()));
-          } else {
+            await commit(finishRun(record, "completed", now()));
+          } else if (nextRetryAt(record, now()) === undefined) {
             throw new UmioError(`Run ${runId} stalled with unfinished nodes.`); // scheduler bug
           }
-          stopAllTimers();
-          await this.release(lease);
-          return record;
+          if (record.status !== "running") {
+            stopAllTimers();
+            await this.release(lease);
+            queue.push(
+              record.status === "needs-recovery"
+                ? needsRecoveryEvent(record, now())
+                : {
+                    type: "run-finish",
+                    runId,
+                    status: record.status as "completed" | "failed" | "cancelled",
+                    at: now(),
+                  },
+            );
+            await queue.drain(this.observerDrainTimeoutMs, this.deps);
+            return record;
+          }
+        }
+
+        // Wake up when the earliest scheduled retry falls due.
+        cancelRetryTimer();
+        cancelRetryTimer = () => {};
+        const retryAt = !halt && !hasUncertain(record) ? nextRetryAt(record, now()) : undefined;
+        if (retryAt !== undefined) {
+          cancelRetryTimer = this.deps.setTimer(retryAt - now(), () => wake.resolve());
         }
 
         const settled = await Promise.race([
@@ -499,44 +784,65 @@ export class WorkflowExecutor {
           wake = deferred();
           continue;
         }
-        const { nodeId, attempt, outcome } = settled;
+        const { nodeId, attempt } = settled;
+        const entry = running.get(nodeId);
+        if (entry?.attempt !== attempt) continue;
         running.delete(nodeId);
+        clearTimers(entry);
         // Apply a result only while its attempt is current (I7).
         const state = record.nodes[nodeId];
         if (state?.status !== "running" || state.attempt !== attempt) continue;
+        // After a timeout, whatever the attempt returns is discarded: it failed with `timeout`.
+        const outcome: Outcome =
+          entry.stop?.reason === "timeout"
+            ? { ok: false, error: entry.stop.error }
+            : settled.outcome;
 
         if (outcome.ok) {
           const decided = decideEdges(definition, record, nodeId, outcome.output);
           if (decided.ok) {
+            const before = record;
             // W2: successors become ready only once this write succeeds (I2).
             await commit(
-              completeNode(
-                graph,
-                record,
-                nodeId,
-                outcome.output,
-                decided.decisions,
-                this.deps.now(),
-              ),
+              completeNode(graph, record, nodeId, outcome.output, decided.decisions, now()),
             );
+            finished(nodeId, "completed");
+            for (const skipped of newlySkipped(before, record)) finished(skipped, "skipped");
           } else {
-            await commit(failNode(record, nodeId, decided.error, this.deps.now()));
+            await commit(failNode(record, nodeId, decided.error, now()));
+            finished(nodeId, "failed");
             if (!halt) startHalt({ kind: "failed", nodeId, error: decided.error });
           }
         } else if (halt) {
-          // Stopped because the run was already failing or being cancelled.
-          await commit(cancelAttempt(record, nodeId, this.deps.now()));
+          // Stopped because the run was already failing or being cancelled (W4).
+          await commit(cancelAttempt(record, nodeId, now()));
+          finished(nodeId, "cancelled");
         } else {
-          await commit(failNode(record, nodeId, outcome.error, this.deps.now()));
-          startHalt({ kind: "failed", nodeId, error: outcome.error });
+          const policy = graph.nodes.find((node) => node.id === nodeId)?.retry;
+          if (shouldRetry(policy, attempt, outcome.error)) {
+            const at = now() + retryDelay(policy, attempt, this.deps.random);
+            await commit(retryNode(record, nodeId, outcome.error, at, now())); // W3
+            queue.push({ type: "node-retry", runId, nodeId, attempt, retryAt: at, at: now() });
+          } else {
+            await commit(failNode(record, nodeId, outcome.error, now())); // W3
+            finished(nodeId, "failed");
+            startHalt({ kind: "failed", nodeId, error: outcome.error });
+          }
         }
       }
     } catch (error) {
       // Lease lost, conflict or store failure: stop everything and write nothing more.
-      stopRunning(error);
+      for (const entry of running.values()) {
+        clearTimers(entry);
+        entry.controller.abort(error);
+      }
+      stopAllTimers();
+      await queue.drain(this.observerDrainTimeoutMs, this.deps);
       throw error;
     } finally {
       stopAllTimers();
+      signal?.removeEventListener("abort", onAbort);
+      this.active.delete(runId);
     }
   }
 
@@ -545,7 +851,7 @@ export class WorkflowExecutor {
     record: WorkflowRun,
     nodeId: NodeId,
     attempt: number,
-    signal: AbortSignal,
+    options: { signal: AbortSignal; deadline?: number; onEvent(event: NodeEvent): void },
   ): Promise<Outcome> {
     const spec = definition.graph.nodes.find((node) => node.id === nodeId);
     const handler = spec && definition.handlers[spec.handler];
@@ -566,14 +872,15 @@ export class WorkflowExecutor {
       attempt,
       input: record.input,
       predecessors: predecessorOutputs(definition.graph, record, nodeId),
-      signal,
+      signal: options.signal,
+      ...(options.deadline !== undefined && { deadline: options.deadline }),
       idempotencyKey: `${record.runId}:${nodeId}`,
       limits: { maxOutputBytes },
       emit: (event) => {
         try {
-          this.options.onNodeEvent?.(nodeId, attempt, event);
+          options.onEvent(event);
         } catch {
-          // Observers never affect the run.
+          // Reporting progress never affects the attempt.
         }
       },
     };
@@ -591,6 +898,40 @@ export class WorkflowExecutor {
     });
     return invalid ? { ok: false, error: invalid } : { ok: true, output: output as JsonValue };
   }
+}
+
+type NodeFinishStatus = Extract<GraphRunEvent, { type: "node-finish" }>["status"];
+
+function timeoutError(nodeId: NodeId, what: string): NodeError {
+  return { code: "timeout", message: `Node "${nodeId}" ${what}.`, retryable: true };
+}
+
+function abandonReason(reason: StopReason | undefined): AbandonReason {
+  switch (reason) {
+    case "timeout":
+      return "abandoned-timeout";
+    case "cancelled":
+      return "abandoned-cancel";
+    default:
+      return "abandoned-failure";
+  }
+}
+
+type AbandonReason = NonNullable<NodeRun["uncertainReason"]>;
+
+function needsRecoveryEvent(record: WorkflowRun, at: number): GraphRunEvent {
+  return {
+    type: "run-needs-recovery",
+    runId: record.runId,
+    nodes: Object.values(record.nodes)
+      .filter((node) => node.status === "uncertain")
+      .map((node) => node.nodeId),
+    at,
+  };
+}
+
+function isTerminal(status: RunStatus): boolean {
+  return status === "completed" || status === "failed" || status === "cancelled";
 }
 
 export function toNodeError(error: unknown): NodeError {
@@ -644,6 +985,19 @@ function checkIdentity(definition: WorkflowDefinition, run: WorkflowRun): void {
     if (run[field] !== actual[field]) {
       throw new DefinitionMismatchError(run.runId, field, run[field], actual[field]);
     }
+  }
+}
+
+function nonNegativeInt(value: number, name: string): number {
+  if (!Number.isInteger(value) || value < 0) {
+    throw new UmioError(`${name} must be a non-negative integer, got ${value}.`);
+  }
+  return value;
+}
+
+function below(value: number, limit: number, name: string): void {
+  if (value >= limit) {
+    throw new UmioError(`${name} (${value}) must be below leaseTtlMs (${limit}).`);
   }
 }
 

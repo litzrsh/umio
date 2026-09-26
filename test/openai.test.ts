@@ -237,6 +237,33 @@ describe("OpenAIProvider streaming", () => {
     expect(events.at(-1)).toMatchObject({ type: "finish", result: { finishReason: "tool-calls" } });
   });
 
+  it("rejects with an abort error when the SDK ends the stream quietly on abort", async () => {
+    const controller = new AbortController();
+    // Like the SDK: once the signal aborts, iteration just stops.
+    const create = vi.fn(async () => ({
+      async *[Symbol.asyncIterator]() {
+        yield chunk({ role: "assistant", content: "Par" });
+        controller.abort();
+      },
+    }));
+    const client = { chat: { completions: { create } } } as unknown as OpenAI;
+    const events: unknown[] = [];
+    const iterate = async () => {
+      for await (const event of new OpenAIProvider({ type: "ollama" }, client).stream({
+        model: "m",
+        messages: [],
+        signal: controller.signal,
+      })) {
+        events.push(event);
+      }
+    };
+    await expect(iterate()).rejects.toMatchObject({
+      message: "Request aborted.",
+      retryable: false,
+    });
+    expect(events).toEqual([{ type: "text-delta", text: "Par" }]); // no finish event
+  });
+
   it("wraps errors thrown while streaming", async () => {
     const create = vi.fn(async () => {
       throw new OpenAI.APIConnectionError({ message: "ECONNREFUSED" });

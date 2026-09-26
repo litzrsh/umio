@@ -7,9 +7,12 @@ import {
 } from "../agents/adr-context.js";
 import type { Agent } from "../agents/agent.js";
 import type { KVStore } from "../cache/kv.js";
+import { LLM } from "../llm/client.js";
 import type { ModelClient } from "../llm/types.js";
 import type { ToolHooks } from "../tools/execute.js";
+import { DEFAULT_NODE_TIMEOUT_MS } from "./executor.js";
 import type { JsonValue, NodeContext, NodeHandler } from "./types.js";
+import { emitWarnings, shortProviderTimeouts } from "./warnings.js";
 
 export interface AgentNodeOptions {
   llm: ModelClient;
@@ -39,9 +42,19 @@ export interface AgentNodeOutput {
  * The node's abort signal reaches the agent's model calls. Agent events and
  * ADR proposals are reported through `context.emit`. The output is
  * `{ text, usage }`.
+ *
+ * When `llm` is an `LLM` whose model runs on a local provider with a request
+ * timeout below the default node timeout (3 h), a process warning is emitted
+ * once: the provider, not the node timeout, would end long calls.
  */
 export function agentNode(agent: Agent, options: AgentNodeOptions): NodeHandler {
   const adr = resolveAdrOptions(options.adr, options.llm);
+  if (options.llm instanceof LLM) {
+    const { config } = options.llm;
+    emitWarnings(
+      shortProviderTimeouts(config, DEFAULT_NODE_TIMEOUT_MS, [agent.model ?? config.defaultModel]),
+    );
+  }
   return async (context) => {
     const task = await (options.task ?? defaultTask)(context);
     // Loaded per invocation; identical text across nodes keeps the provider's prompt cache warm.

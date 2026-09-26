@@ -59,14 +59,15 @@ const definition: WorkflowDefinition = {
   },
 };
 
-const executor = WorkflowExecutor.fromConfig(llm.config, {
-  onNodeEvent: (nodeId, _attempt, event) => {
-    if (event.type === "agent-event" && event.event.type === "step-finish") {
-      console.error(`[${nodeId}] model call finished`);
-    }
+const executor = WorkflowExecutor.fromConfig(llm.config);
+const run = await executor.run(definition, request, {
+  observer: {
+    emit: (event) => {
+      if (event.type === "node-start") console.error(`[${event.nodeId}] started`);
+      if (event.type === "node-finish") console.error(`[${event.nodeId}] ${event.status}`);
+    },
   },
 });
-const run = await executor.run(definition, request);
 
 for (const [id, node] of Object.entries(run.nodes)) {
   console.error(
