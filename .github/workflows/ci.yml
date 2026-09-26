@@ -26,7 +26,8 @@ jobs:
       - run: npm run typecheck
       - run: npm run lint
       - run: npm run schema:check
-      # Builds (prepack), then checks exports, types and the packed tarball.
+      # Builds, then checks exports, types and the packed tarball (publint packs
+      # with scripts disabled, so it must not rely on prepack).
       - run: npm run check:package
 
   test:

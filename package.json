@@ -77,7 +77,7 @@
     "test:postgres": "UMIO_TEST_POSTGRES_URL=${UMIO_TEST_POSTGRES_URL:-postgres://umio:umio@localhost:55432/umio} vitest run test/checkpoint-postgres-server.test.ts",
     "example:skills": "tsx examples/skills.ts",
     "schema:check": "tsx scripts/generate-schema.ts --check",
-    "check:package": "publint --strict && attw --pack . --profile node16",
+    "check:package": "npm run build && publint --strict && attw --pack . --profile node16",
     "prepack": "npm run build",
     "release:check": "npm run typecheck && npm run lint && npm run schema:check && npm test && npm run check:package"
   },
