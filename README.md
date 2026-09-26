@@ -389,7 +389,7 @@ Files are read as `NNNN-*.md`. The status comes from a `## Status` section or a 
 
 ### Graph workflows (in progress)
 
-`WorkflowExecutor` runs a directed acyclic graph of nodes: branches, parallel paths and joins. It is being built in phases (see `docs/work/umio-graph-workflow-plan.md`). **Runs are currently kept in memory only**; checkpoints, resumption, retries, timeouts and cancellation come in later phases.
+`WorkflowExecutor` runs a directed acyclic graph of nodes: branches, parallel paths and joins. It is being built in phases (see `docs/work/umio-graph-workflow-plan.md`). Every change to a run is checkpointed to a `CheckpointStore`; **resuming an interrupted run, retries, timeouts and the full cancel flow come in later phases.**
 
 ```typescript
 import { agentNode, WorkflowExecutor, type WorkflowDefinition } from "umio";
@@ -452,6 +452,13 @@ run.nodes.merge?.output;  // { text, usage } from agentNode
 **Outputs**
 - Outputs must be JSON and at most `maxOutputBytes` (default 256 KiB; configurable per executor, per node, or in the config's `graph` section).
 - For larger results, store the data yourself and return an `ArtifactRef` (`{ $artifact: { uri, sha256, bytes, mediaType? } }`). umio never reads or deletes artifacts; retention is yours, and `collectArtifactRefs(run)` lists them.
+
+**Checkpoints and leases**
+- Pass `store` to the executor; the default is an in-memory `MemoryCheckpointStore` per executor. A node's attempt is recorded before its handler runs, and its successors start only after its result is recorded.
+- The executor holds a **lease** on each run it owns (30 s, renewed every 10 s on its own timer), so a model call that is silent for hours never looks like a dead executor. Every write is a compare-and-swap fenced by that lease: once another owner could have taken over, the old one cannot write.
+- If the lease is lost, the executor aborts running nodes, writes nothing more and rejects with `LeaseLostError`. A write that conflicts under a valid lease rejects with `CheckpointConflictError`.
+- `store.requestCancel(runId)` asks the owner to stop. It notices within 2 s (`cancelPollIntervalMs`), aborts running nodes, starts nothing new and ends the run `cancelled`. A handler that ignores its signal is still waited for, for now.
+- Custom stores implement `CheckpointStore` and should pass the contract suite in `test/checkpoint-contract.ts`. umio never claims exactly-once execution: use `idempotencyKey` to deduplicate side effects.
 
 The sequential `Workflow` above runs on the same executor internally, with unchanged behavior.
 

@@ -1,14 +1,34 @@
-// Public graph-workflow surface. Checkpoint stores, retries, timeouts,
-// cancellation and resumption arrive in later phases
-// (docs/work/umio-graph-workflow-plan.md); until then runs are in memory.
+// Public graph-workflow surface. Retries, timeouts, the full cancel flow and
+// resumption arrive in later phases (docs/work/umio-graph-workflow-plan.md).
 export {
   type AgentNodeOptions,
   type AgentNodeOutput,
   agentNode,
   defaultTask,
 } from "./agent-node.js";
-export { GraphNodeError, GraphValidationError } from "./errors.js";
 export {
+  MemoryCheckpointStore,
+  type MemoryCheckpointStoreOptions,
+} from "./checkpoint/memory.js";
+export {
+  assertCheckpointSchema,
+  type CasResult,
+  CHECKPOINT_SCHEMA_VERSION,
+  type CheckpointStore,
+  type Lease,
+} from "./checkpoint/store.js";
+export {
+  CheckpointConflictError,
+  CheckpointSchemaError,
+  GraphNodeError,
+  GraphValidationError,
+  LeaseLostError,
+  RunNotFoundError,
+} from "./errors.js";
+export {
+  DEFAULT_CANCEL_POLL_INTERVAL_MS,
+  DEFAULT_LEASE_RENEW_INTERVAL_MS,
+  DEFAULT_LEASE_TTL_MS,
   DEFAULT_MAX_CONCURRENCY,
   DEFAULT_MAX_OUTPUT_BYTES,
   type GraphRunOptions,

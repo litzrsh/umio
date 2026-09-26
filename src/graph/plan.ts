@@ -189,7 +189,7 @@ export function cancelAttempt(run: WorkflowRun, nodeId: NodeId, now: number): Wo
 /** W5: the run's terminal status. */
 export function finishRun(
   run: WorkflowRun,
-  status: "completed" | "failed",
+  status: "completed" | "failed" | "cancelled",
   now: number,
   error?: WorkflowRun["error"],
 ): WorkflowRun {

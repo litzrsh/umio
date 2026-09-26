@@ -21,3 +21,46 @@ export class GraphNodeError extends UmioError {
     this.retryable = details.retryable ?? false;
   }
 }
+
+/** No run with this ID exists in the checkpoint store. */
+export class RunNotFoundError extends UmioError {
+  constructor(readonly runId: string) {
+    super(`Run "${runId}" not found.`);
+  }
+}
+
+/**
+ * A checkpoint write was rejected although this executor held a valid lease
+ * (the stored revision moved), or a run was created under an existing ID.
+ * Either means the single-writer invariant was broken; the executor stops
+ * without writing anything more.
+ */
+export class CheckpointConflictError extends UmioError {
+  constructor(
+    readonly runId: string,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
+/** A checkpoint record has a `schemaVersion` this version of umio cannot read. */
+export class CheckpointSchemaError extends UmioError {
+  constructor(
+    readonly runId: string,
+    readonly schemaVersion: unknown,
+  ) {
+    super(`Run "${runId}" has unsupported checkpoint schemaVersion ${String(schemaVersion)}.`);
+  }
+}
+
+/**
+ * This executor no longer holds the run's lease: a renewal was refused, the
+ * lease expired, or a write was fenced off. Running attempts were aborted and
+ * nothing more was written; the next lease holder recovers the run.
+ */
+export class LeaseLostError extends UmioError {
+  constructor(readonly runId: string) {
+    super(`Lost the lease on run "${runId}"; stopped without further writes.`);
+  }
+}
