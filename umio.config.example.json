@@ -1,0 +1,63 @@
+{
+  "$schema": "./schema/umio.config.schema.json",
+  "defaultModel": "smart",
+  "providers": {
+    "anthropic": {
+      "type": "anthropic",
+      "apiKey": "${ANTHROPIC_API_KEY}"
+    },
+    "openai": {
+      "type": "openai",
+      "apiKey": "${OPENAI_API_KEY}"
+    },
+    "ollama": {
+      "type": "ollama",
+      "baseURL": "${OLLAMA_BASE_URL:-http://localhost:11434/v1}"
+    },
+    "lmstudio": {
+      "type": "openai-compatible",
+      "baseURL": "http://localhost:1234/v1"
+    }
+  },
+  "models": {
+    "smart": {
+      "provider": "anthropic",
+      "model": "claude-opus-5",
+      "maxTokens": 16000,
+      "promptCache": true,
+      "options": {
+        "output_config": { "effort": "high" },
+        "betas": ["server-side-fallback-2026-07-01"],
+        "fallbacks": "default"
+      }
+    },
+    "gpt": {
+      "provider": "openai",
+      "model": "gpt-5"
+    },
+    "local": {
+      "provider": "ollama",
+      "model": "llama3.2",
+      "harness": "local-agent"
+    }
+  },
+  "harnesses": {
+    "local-agent": {
+      "system": "You run on a small local model. Be concise and use tools only when needed.",
+      "toolLoop": { "maxSteps": 6, "maxToolOutputChars": 4000 }
+    }
+  },
+  "adr": {
+    "path": "docs/adr"
+  },
+  "tools": {
+    "repo": { "use": "files", "root": ".", "readOnly": true },
+    "web": { "use": "web" },
+    "misc": { "use": "utilities" }
+  },
+  "responseCache": {
+    "store": "file",
+    "path": ".umio/cache",
+    "ttlSeconds": 86400
+  }
+}

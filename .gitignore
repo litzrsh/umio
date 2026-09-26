@@ -1,0 +1,15 @@
+# Claude is ignored
+.claude
+CLAUDE.md
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/
+.ignore
+.mcp.json
+
+node_modules/
+dist/
+coverage/
+# Response cache (responseCache.store = "file").
+.umio/
+# Local runtime config; commit umio.config.example.json instead.
+/umio.config.json
