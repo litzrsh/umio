@@ -12,7 +12,8 @@
 |---|---|
 | P0: Characterization tests | Done (`669c0b4`); `test/workflow-compat.test.ts` |
 | P-T: Provider and transport time limits, `maxConcurrentRequests` | Done; `test/local-providers.test.ts` (classification, defaults, a real HTTP server for header timeouts, retries and aborts, and the limiter). Verified live against local Ollama. |
-| P1–P5 | Not started |
+| P1: Types, validation, identity, planning, adapter | Done; `src/graph/` (types, errors, runtime, identity, validate, plan, executor), `src/agents/adr-context.ts`, `Workflow.run()` on the executor. Tests in `test/graph.test.ts`; the P0 suite passes unchanged. Verified live with `examples/workflow.ts` on local Ollama. The executor stays internal until P3/P4; conditional edges and `join: "any"` validate but are rejected at run time until P2. |
+| P2–P5 | Not started |
 
 ### Changes in revision 4
 

@@ -26,6 +26,7 @@ export {
   UmioConfigSchema,
 } from "./config/schema.js";
 export { ConfigError, LLMError, UmioError } from "./errors.js";
+export * from "./graph/index.js";
 export { LLM, type LLMOptions } from "./llm/client.js";
 export {
   type EffectiveProviderSettings,
