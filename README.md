@@ -141,14 +141,22 @@ export default ({ llm }) => ({
 umio graph run review.workflow.mjs --input "Store uploads on local disk?"   # prints the run ID and a node table
 umio graph status <run-id>             # nodes, attempts, owner, and nodes needing recovery
 umio graph list [--needs-recovery]
-umio graph cancel <run-id>
+umio graph cancel <run-id> [--wait]    # from any terminal; see below
 umio graph resume review.workflow.mjs <run-id>
 umio graph recover review.workflow.mjs <run-id> <node-id> --retry
 umio graph recover review.workflow.mjs <run-id> <node-id> --complete '{"text":"…"}'
 umio graph recover review.workflow.mjs <run-id> <node-id> --fail --reason "charged twice; refunded"
 ```
 
-- **Where runs are kept:** in `.umio/runs` next to the config (`--store <dir>` to change it), using the experimental `FileCheckpointStore`. It is single-process. `status` and `list` read it while another `umio` process is running a workflow; `cancel`, `resume` and `recover` wait for that process to finish.
+- **Where runs are kept:** in `.umio/runs` next to the config (`--store <dir>` to change it), using the experimental `FileCheckpointStore`. Only one process writes it at a time. While another `umio` process holds it, `status` and `list` still work, `cancel` sends a request (below), and `resume` and `recover` fail immediately with a lock error that names the process. They do not wait; run them again once that process has finished.
+- **Cancelling from another terminal:** `umio graph cancel <run-id>` writes a small cancel-request file next to the run (atomically). It never writes the run's checkpoint or lease. The process driving the run checks for requests every ~2 s on its own timer, so it notices even during a silent multi-hour model call. It then cancels through its executor's normal, fenced path: running nodes are aborted and given their grace period, and the run is recorded `cancelled`.
+  - **The reply distinguishes recorded from confirmed.** Without `--wait`, the command returns as soon as the request is stored: "Cancel request recorded — not yet confirmed". With `--wait` (up to `--timeout`, default 30 s), it watches the run until it ends: "Confirmed: run … is cancelled", or it reports that the run finished some other way first (exit 1), or that it is not confirmed yet (exit 1, and the request stays recorded).
+  - `graph status` shows a request the owner has not picked up yet ("cancel requested 3s ago by pid …, not yet picked up by the owner"), and `--json` reports it as `cancelRequest: "pending" | "recorded" | "none"`.
+  - Repeated cancels are idempotent (`already-requested`).
+  - A request for a run that has already finished is refused (`already-terminal`). One that arrives just as the run completes is discarded; the run stays `completed`.
+  - A request is tied to one run instance, so a leftover request never cancels a later run that reuses the ID.
+  - If the owner crashes before applying a request, the request is kept. `cancel --wait` finalizes the run itself once the dead owner's lease expires, and otherwise the next `resume` honors it. Either way, the node that was running becomes `uncertain`.
+  - When no other process holds the store, `cancel` goes through the executor's `cancel()` directly.
 - **Ctrl+C during `run` or `resume`:** the first press cancels the run explicitly. The cancel is recorded, and running nodes get their grace period. A second press exits at once without finalizing. `graph status` then shows the run as interrupted, and `graph resume` marks its running nodes uncertain instead of running them again. SIGTERM behaves like the second press.
 - **Nodes needing recovery:** `status` and `run` list every `uncertain` node with its reason, attempt and idempotency key, say plainly that its side effects may have happened, and print the three explicit `recover` commands. umio never picks one, and never retries an uncertain node automatically.
 - The module must import `umio` from the same installation as the command (run the CLI with `npx umio` in the project that depends on it), so both share one copy of the library.
@@ -620,7 +628,7 @@ run.nodes.merge?.output;  // { text, usage } from agentNode
 - The executor holds a **lease** on each run it owns (30 s, renewed every 10 s on its own timer), so a model call that is silent for hours never looks like a dead executor. Every write is a compare-and-swap fenced by that lease: once another owner could have taken over, the old one cannot write.
 - If the lease is lost, the executor aborts running nodes, writes nothing more and rejects with `LeaseLostError`. A write that conflicts under a valid lease rejects with `CheckpointConflictError`.
 - Custom stores implement `CheckpointStore` and should pass the contract suite in `test/checkpoint-contract.ts`. umio never claims exactly-once execution: use `idempotencyKey` to deduplicate side effects.
-- `FileCheckpointStore.open({ dir })` keeps runs on disk so they survive a restart. It is **experimental and single-process only**: never share its directory between processes. It refuses to open a directory another live process is using.
+- `FileCheckpointStore.open({ dir })` keeps runs on disk so they survive a restart. It is **experimental and single-process only**: never share its directory between processes. It refuses to open a directory another live process is using. Other processes can still read runs with `FileCheckpointStore.snapshot()`/`snapshots()`, and ask the holder to cancel one with `FileCheckpointStore.submitCancelRequest(dir, runId)`. That call writes a separate control file, which the holder applies on its next cancel check; it never writes the run itself.
 
 **Resuming after a crash**
 - `executor.resume(definition, runId)` continues a run whose process died. Pass the same definition (graph ID, `version`, structure) with fresh handlers; a mismatch rejects with `DefinitionMismatchError`.

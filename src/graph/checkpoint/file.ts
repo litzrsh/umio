@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, open, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, open, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { UmioError } from "../../errors.js";
 import {
@@ -21,6 +21,8 @@ interface Entry {
   token: number;
   lease?: { ownerId: string; token: number; expiresAt: number };
   cancelRequested: boolean;
+  /** Random per `create()`: tells a run from a later one that reuses its ID. */
+  instance?: string;
 }
 
 export interface FileCheckpointStoreOptions {
@@ -36,7 +38,38 @@ export interface StoredRunSnapshot {
   readonly cancelRequested: boolean;
   /** The lease as last written; compare `expiresAt` with the current time. */
   readonly lease?: { readonly ownerId: string; readonly expiresAt: number };
+  /** Identifies this run as opposed to an earlier or later run with the same ID. */
+  readonly instance: string;
+  /**
+   * A cancel request submitted from outside the owning process
+   * ({@link FileCheckpointStore.submitCancelRequest}) that the store holder has
+   * not picked up yet. Only reported while the run is not terminal.
+   */
+  readonly pendingCancelRequest?: { readonly requestedAt: number; readonly pid: number };
 }
+
+/** What {@link FileCheckpointStore.submitCancelRequest} did. */
+export type CancelRequestReceipt =
+  /** The request file was written; the store holder applies it on its next cancel check. */
+  | { readonly outcome: "recorded"; readonly instance: string; readonly requestedAt: number }
+  /** A request is already recorded (in the run, or as a pending request file). */
+  | { readonly outcome: "already-requested"; readonly instance: string }
+  | { readonly outcome: "already-terminal"; readonly status: WorkflowRun["status"] }
+  /** No such run, or not the run instance the caller expected. */
+  | { readonly outcome: "not-found" };
+
+/** The control file a requester writes; never read as a checkpoint. */
+interface CancelRequestFile {
+  readonly version: 1;
+  readonly runId: string;
+  readonly instance: string;
+  readonly requestedAt: number;
+  readonly pid: number;
+}
+
+const CONTROL_DIR = "control";
+/** Temporary control files older than this are leftovers of a crashed requester. */
+const STALE_TEMP_MS = 60_000;
 
 /** Directories held by open stores in this process. */
 const openDirs = new Set<string>();
@@ -53,6 +86,13 @@ const openDirs = new Set<string>();
  * - `open()` claims the directory with an `owner.pid` file and rejects while
  *   another open instance or live process holds it. This guard is a
  *   best-effort safety net, not a correctness mechanism.
+ * - Other processes may only **ask** for a cancel, with the static
+ *   {@link FileCheckpointStore.submitCancelRequest}. It writes a separate
+ *   control file (`control/<run>.cancel.json`, atomically) and never touches
+ *   run files or leases. The holder reads it in `isCancelRequested` (which the
+ *   executor polls every `cancelPollIntervalMs`, on its own timer) and records
+ *   it in the run under its own mutex, so the run is still only written by
+ *   one process and the cancel goes through the executor's normal, fenced path.
  *
  * For several processes, use a store backed by a database with real CAS and
  * run the contract suite (`test/checkpoint-contract.ts`) against it.
@@ -81,6 +121,7 @@ export class FileCheckpointStore implements CheckpointStore {
         throw new CheckpointStoreLockedError(store.dir, holder);
       }
       await writeFile(pidFile, String(process.pid));
+      await store.sweepControlFiles();
     } catch (error) {
       openDirs.delete(store.dir);
       throw error;
@@ -89,12 +130,58 @@ export class FileCheckpointStore implements CheckpointStore {
   }
 
   /**
+   * Asks the process holding `dir` to cancel a run, without opening the store.
+   * Safe to call while another process holds it: it only writes an atomic
+   * control file, never the run file or its lease. `instance` (from a
+   * snapshot) pins the request to the run the caller saw.
+   *
+   * - The holder applies it on its next cancel check (within about
+   *   `cancelPollIntervalMs` while it drives the run). If nobody drives the
+   *   run, the request stays pending and is applied by the next `open()`er
+   *   when it resumes, recovers or cancels the run.
+   * - Idempotent: a second request for the same run instance is
+   *   `already-requested`. A request for a run that is terminal (or ends
+   *   before it is applied) is discarded, and one for an earlier run with the
+   *   same ID never matches a later one.
+   */
+  static async submitCancelRequest(
+    dir: string,
+    runId: string,
+    options: { instance?: string; now?: () => number } = {},
+  ): Promise<CancelRequestReceipt> {
+    const root = resolve(dir);
+    const entry = await readEntry(join(root, fileName(runId)));
+    if (!entry) return { outcome: "not-found" };
+    const instance = instanceOf(entry);
+    if (options.instance !== undefined && options.instance !== instance)
+      return { outcome: "not-found" };
+    if (isTerminal(entry.record.status)) {
+      return { outcome: "already-terminal", status: entry.record.status };
+    }
+    const file = controlFile(root, runId);
+    if (entry.cancelRequested || (await readControl(file))?.instance === instance) {
+      return { outcome: "already-requested", instance };
+    }
+    const requestedAt = (options.now ?? Date.now)();
+    const request: CancelRequestFile = {
+      version: 1,
+      runId,
+      instance,
+      requestedAt,
+      pid: process.pid,
+    };
+    await mkdir(join(root, CONTROL_DIR), { recursive: true });
+    await atomicWrite(file, JSON.stringify(request));
+    return { outcome: "recorded", instance, requestedAt };
+  }
+
+  /**
    * Reads one run without opening the store, so it works while another
    * process holds the directory (writes are atomic renames, so a read sees a
    * whole file). For inspection only: it takes no lease and never writes.
    */
   static async snapshot(dir: string, runId: string): Promise<StoredRunSnapshot | undefined> {
-    return readSnapshot(join(resolve(dir), fileName(runId)));
+    return readSnapshot(resolve(dir), fileName(runId));
   }
 
   /** Every run in the directory, read as by {@link FileCheckpointStore.snapshot}. */
@@ -108,7 +195,7 @@ export class FileCheckpointStore implements CheckpointStore {
     }
     const runs: StoredRunSnapshot[] = [];
     for (const name of names.filter((item) => item.endsWith(".run.json")).sort()) {
-      const run = await readSnapshot(join(resolve(dir), name));
+      const run = await readSnapshot(resolve(dir), name);
       if (run) runs.push(run);
     }
     return runs;
@@ -136,6 +223,7 @@ export class FileCheckpointStore implements CheckpointStore {
         token: 1,
         lease: { ownerId, token: 1, expiresAt },
         cancelRequested: false,
+        instance: randomUUID(),
       });
       return { runId: run.runId, ownerId, token: 1, expiresAt };
     });
@@ -195,12 +283,62 @@ export class FileCheckpointStore implements CheckpointStore {
     });
   }
 
+  /**
+   * Also picks up a request another process submitted with
+   * {@link FileCheckpointStore.submitCancelRequest}: a request for this run
+   * instance is recorded in the run (so it survives a crash) and its file
+   * removed; a stale one (another instance, or a terminal run) is removed.
+   */
   isCancelRequested(runId: string): Promise<boolean> {
-    return this.exclusive(async () => (await this.read(runId))?.cancelRequested ?? false);
+    return this.exclusive(async () => {
+      const entry = await this.read(runId);
+      const file = controlFile(this.dir, runId);
+      const request = await readControl(file);
+      if (!entry) {
+        if (request) await rm(file, { force: true });
+        return false;
+      }
+      if (!request) return entry.cancelRequested;
+      const applies = request.instance === instanceOf(entry) && !isTerminal(entry.record.status);
+      if (applies && !entry.cancelRequested) await this.write({ ...entry, cancelRequested: true });
+      await rm(file, { force: true });
+      return entry.cancelRequested || applies;
+    });
   }
 
   delete(runId: string): Promise<void> {
-    return this.exclusive(() => rm(this.fileFor(runId), { force: true }));
+    return this.exclusive(async () => {
+      await rm(this.fileFor(runId), { force: true });
+      await rm(controlFile(this.dir, runId), { force: true });
+    });
+  }
+
+  /**
+   * On open: removes request files that can no longer apply (run gone,
+   * another instance, or terminal) and temporary files a crashed requester
+   * left behind. Requests for live runs stay until they are applied.
+   */
+  private async sweepControlFiles(): Promise<void> {
+    const dir = join(this.dir, CONTROL_DIR);
+    const names = await readdir(dir).catch(() => [] as string[]);
+    for (const name of names) {
+      const path = join(dir, name);
+      if (name.endsWith(".tmp")) {
+        const info = await stat(path).catch(() => undefined);
+        if (info && this.now() - info.mtimeMs > STALE_TEMP_MS) await rm(path, { force: true });
+        continue;
+      }
+      const request = await readControl(path);
+      const entry = request ? await this.read(request.runId) : undefined;
+      if (
+        !request ||
+        !entry ||
+        request.instance !== instanceOf(entry) ||
+        isTerminal(entry.record.status)
+      ) {
+        await rm(path, { force: true });
+      }
+    }
   }
 
   /** Runs `task` after every earlier operation of this instance has settled. */
@@ -234,21 +372,7 @@ export class FileCheckpointStore implements CheckpointStore {
 
   /** Writes and flushes a temporary file, then renames it over the run file. */
   private async write(entry: Entry): Promise<void> {
-    const file = this.fileFor(entry.record.runId);
-    const temp = `${file}.${randomUUID()}.tmp`;
-    const handle = await open(temp, "w");
-    try {
-      await handle.writeFile(JSON.stringify(entry));
-      await handle.sync();
-    } finally {
-      await handle.close();
-    }
-    try {
-      await rename(temp, file);
-    } catch (error) {
-      await rm(temp, { force: true });
-      throw error;
-    }
+    await atomicWrite(this.fileFor(entry.record.runId), JSON.stringify(entry));
   }
 
   private fileFor(runId: string): string {
@@ -269,7 +393,7 @@ function fileName(runId: string): string {
   return `${encodeURIComponent(runId)}.run.json`;
 }
 
-async function readSnapshot(file: string): Promise<StoredRunSnapshot | undefined> {
+async function readEntry(file: string): Promise<Entry | undefined> {
   let text: string;
   try {
     text = await readFile(file, "utf8");
@@ -279,13 +403,72 @@ async function readSnapshot(file: string): Promise<StoredRunSnapshot | undefined
   }
   const entry = JSON.parse(text) as Entry;
   assertCheckpointSchema(entry.record);
+  return entry;
+}
+
+async function readSnapshot(root: string, name: string): Promise<StoredRunSnapshot | undefined> {
+  const entry = await readEntry(join(root, name));
+  if (!entry) return undefined;
+  const instance = instanceOf(entry);
+  const request = await readControl(controlFile(root, entry.record.runId));
+  const pending =
+    request?.instance === instance && !entry.cancelRequested && !isTerminal(entry.record.status);
   return {
     record: entry.record,
     cancelRequested: entry.cancelRequested,
     ...(entry.lease && {
       lease: { ownerId: entry.lease.ownerId, expiresAt: entry.lease.expiresAt },
     }),
+    instance,
+    ...(pending && {
+      pendingCancelRequest: { requestedAt: request.requestedAt, pid: request.pid },
+    }),
   };
+}
+
+/** Runs created before instances existed are told apart by their creation time. */
+function instanceOf(entry: Entry): string {
+  return entry.instance ?? `created-${entry.record.createdAt}`;
+}
+
+function isTerminal(status: WorkflowRun["status"]): boolean {
+  return status === "completed" || status === "failed" || status === "cancelled";
+}
+
+function controlFile(root: string, runId: string): string {
+  return join(root, CONTROL_DIR, `${encodeURIComponent(runId)}.cancel.json`);
+}
+
+/** A valid request file, or undefined (missing, or unreadable: treated as absent). */
+async function readControl(file: string): Promise<CancelRequestFile | undefined> {
+  try {
+    const value = JSON.parse(await readFile(file, "utf8")) as Partial<CancelRequestFile>;
+    return value.version === 1 &&
+      typeof value.runId === "string" &&
+      typeof value.instance === "string"
+      ? (value as CancelRequestFile)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Writes and flushes a temporary file, then renames it over `file`. */
+async function atomicWrite(file: string, text: string): Promise<void> {
+  const temp = `${file}.${randomUUID()}.tmp`;
+  const handle = await open(temp, "w");
+  try {
+    await handle.writeFile(text);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  try {
+    await rename(temp, file);
+  } catch (error) {
+    await rm(temp, { force: true });
+    throw error;
+  }
 }
 
 function isAlive(pid: number): boolean {

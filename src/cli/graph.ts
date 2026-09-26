@@ -10,6 +10,7 @@ import { dirname, extname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { UmioConfig } from "../config/schema.js";
 import { FileCheckpointStore, type StoredRunSnapshot } from "../graph/checkpoint/file.js";
+import { CheckpointStoreLockedError } from "../graph/errors.js";
 import { WorkflowExecutor } from "../graph/executor.js";
 import type {
   CancelAck,
@@ -183,8 +184,131 @@ export async function resumeGraph(
   );
 }
 
-export async function cancelGraph(dir: string, runId: string): Promise<CancelAck> {
-  return withExecutor(dir, undefined, (executor) => executor.cancel(runId));
+/**
+ * What `umio graph cancel` achieved. `recorded`, `already-requested` and
+ * `requested` only mean the request is stored; `confirmed` says whether the
+ * run was then seen to end (with `--wait`), and how.
+ */
+export interface CancelReport {
+  readonly runId: string;
+  readonly outcome:
+    | "recorded" // a request file for the process holding the store
+    | "already-requested"
+    | "requested" // recorded in the run; its (crashed) owner's lease has not expired yet
+    | "cancelled" // finalized by this command: nobody owned the run
+    | "already-terminal"
+    | "not-found";
+  /** How the request travelled: a control file (store held by another process) or the store itself. */
+  readonly via?: "control-file" | "store";
+  /** The final status seen while waiting; absent without --wait or on timeout. */
+  readonly confirmed?: WorkflowRun["status"];
+  readonly waited?: "ended" | "timeout";
+  readonly status?: WorkflowRun["status"];
+  /** The run was being driven by a live process when the request was made. */
+  readonly ownerActive?: boolean;
+}
+
+export interface CancelOptions {
+  readonly wait: boolean;
+  readonly timeoutMs: number;
+  readonly now: () => number;
+  readonly sleep?: (ms: number) => Promise<void>;
+  readonly pollMs?: number;
+}
+
+/**
+ * Cancels a run from any process. If this process can open the store (no
+ * other umio process holds it), the executor's `cancel()` does it. If another
+ * process holds it, only a cancel *request* is written beside the run, which
+ * that process applies through its executor's normal path; nothing here ever
+ * writes the run or its lease.
+ */
+export async function cancelRun(
+  dir: string,
+  runId: string,
+  options: CancelOptions,
+): Promise<CancelReport> {
+  const snapshot = await FileCheckpointStore.snapshot(dir, runId);
+  if (!snapshot) return { runId, outcome: "not-found" };
+  if (isTerminalStatus(snapshot.record.status)) {
+    return { runId, outcome: "already-terminal", status: snapshot.record.status };
+  }
+  const holder = await storeHolder(dir);
+  const ownerActive = Boolean(
+    holder?.alive &&
+      snapshot.lease &&
+      snapshot.lease.expiresAt > options.now() &&
+      snapshot.record.status === "running",
+  );
+  const report = await submit(dir, runId, snapshot.instance, ownerActive);
+  if (!options.wait || !["recorded", "already-requested", "requested"].includes(report.outcome)) {
+    return report;
+  }
+
+  const sleep =
+    options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const deadline = options.now() + options.timeoutMs;
+  while (options.now() < deadline) {
+    await sleep(options.pollMs ?? 250);
+    const current = await FileCheckpointStore.snapshot(dir, runId);
+    if (!current || current.instance !== snapshot.instance) return { ...report, waited: "ended" };
+    const status = current.record.status;
+    if (isTerminalStatus(status) || status === "needs-recovery") {
+      return { ...report, waited: "ended", confirmed: status };
+    }
+    // The owner died before finishing: once its lease has expired, finalize
+    // through the executor's own cancel (W7) instead of waiting forever.
+    const leaseExpired = !current.lease || current.lease.expiresAt <= options.now();
+    if (leaseExpired && !(await storeHolder(dir))?.alive) {
+      const direct = await submit(dir, runId, snapshot.instance, false);
+      if (direct.outcome === "cancelled") {
+        return { ...report, waited: "ended", confirmed: "cancelled", via: report.via ?? "store" };
+      }
+    }
+  }
+  return { ...report, waited: "timeout" };
+}
+
+async function submit(
+  dir: string,
+  runId: string,
+  instance: string,
+  ownerActive: boolean,
+): Promise<CancelReport> {
+  let store: FileCheckpointStore | undefined;
+  try {
+    store = await FileCheckpointStore.open({ dir });
+  } catch (error) {
+    if (!(error instanceof CheckpointStoreLockedError)) throw error;
+  }
+  if (!store) {
+    const receipt = await FileCheckpointStore.submitCancelRequest(dir, runId, { instance });
+    switch (receipt.outcome) {
+      case "recorded":
+      case "already-requested":
+        return { runId, outcome: receipt.outcome, via: "control-file", ownerActive };
+      case "already-terminal":
+        return { runId, outcome: "already-terminal", status: receipt.status };
+      default:
+        return { runId, outcome: "not-found" };
+    }
+  }
+  try {
+    const ack: CancelAck = await new WorkflowExecutor({ store }).cancel(runId);
+    return {
+      runId,
+      outcome: ack.outcome,
+      via: "store",
+      ownerActive: false,
+      ...(ack.status && { status: ack.status }),
+    };
+  } finally {
+    await store.close();
+  }
+}
+
+function isTerminalStatus(status: WorkflowRun["status"]): boolean {
+  return status === "completed" || status === "failed" || status === "cancelled";
 }
 
 export async function recoverGraph(
@@ -255,8 +379,14 @@ export async function storeHolder(dir: string): Promise<StoreHolder | undefined>
 
 /** Who owns a run right now, from the stored lease, control record and store holder. */
 export function ownership(snapshot: StoredRunSnapshot, now: number, holder?: StoreHolder): string {
-  const { record, lease, cancelRequested } = snapshot;
-  const cancel = cancelRequested && record.status !== "cancelled" ? "; cancel requested" : "";
+  const { record, lease } = snapshot;
+  const pending = cancelState(snapshot);
+  const cancel =
+    pending === "pending"
+      ? `; cancel requested ${Math.max(0, Math.round((now - (snapshot.pendingCancelRequest?.requestedAt ?? now)) / 1_000))}s ago by pid ${snapshot.pendingCancelRequest?.pid}, not yet picked up by the owner`
+      : pending === "recorded"
+        ? "; cancel requested (recorded in the run, being applied)"
+        : "";
   if (record.status !== "running") return `not owned${cancel}`;
   if (lease && lease.expiresAt > now) {
     const left = `${Math.ceil((lease.expiresAt - now) / 1_000)}s`;
@@ -266,6 +396,16 @@ export function ownership(snapshot: StoredRunSnapshot, now: number, holder?: Sto
     return `owned by a live executor${holder ? ` (pid ${holder.pid})` : ""}, lease valid for ${left}${cancel}`;
   }
   return `interrupted — no live owner; continue with \`umio graph resume\`${cancel}`;
+}
+
+/**
+ * `pending`: a request file the holder has not picked up; `recorded`: in the
+ * run, the owner (or the next resume) is applying it; `none` otherwise.
+ */
+export function cancelState(snapshot: StoredRunSnapshot): "none" | "pending" | "recorded" {
+  if (isTerminalStatus(snapshot.record.status)) return "none";
+  if (snapshot.cancelRequested) return "recorded";
+  return snapshot.pendingCancelRequest ? "pending" : "none";
 }
 
 export function defaultStoreFor(

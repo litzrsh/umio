@@ -71,7 +71,7 @@ never called. Exit code 1 if any check fails.
   umio graph status <run-id>
   umio graph list [--needs-recovery]
   umio graph resume <module> <run-id>
-  umio graph cancel <run-id>
+  umio graph cancel <run-id> [--wait [--timeout <duration>]]
   umio graph recover <module> <run-id> <node-id> --retry
   umio graph recover <module> <run-id> <node-id> --complete <json> | --complete-file <file>
   umio graph recover <module> <run-id> <node-id> --fail [--reason <text>]
@@ -79,6 +79,17 @@ never called. Exit code 1 if any check fails.
 <module> is an ES module whose default export is a WorkflowDefinition or a
 function ({ llm, config }) => WorkflowDefinition. Runs are checkpointed in
 --store (default .umio/runs next to the config); that store is single-process.
+While another umio process holds it, status and list still work, cancel sends
+a request (below), and resume and recover fail at once with a lock error.
+
+cancel works from any terminal. If another umio process is driving the run, it
+writes a cancel request file; that process picks it up within ~2 s, even during
+a silent model call, and stops the run through its normal cancel path. The
+reply says "recorded — not yet confirmed". --wait (up to --timeout, default
+30s) waits until the run is seen to end: "Confirmed: … cancelled", or that it
+ended otherwise first (exit 1). If the owner died, --wait finalizes the cancel
+itself once its lease expires. Exit 0: recorded or confirmed; 1: not found,
+not confirmed in time, or the run ended some other way.
 
 Ctrl+C during run/resume cancels the run (recorded; nodes get a grace period).
 A second Ctrl+C exits at once and leaves the run as it is: \`graph status\`

@@ -49,7 +49,13 @@ export type Command =
   | { readonly kind: "graph-status"; readonly runId: string }
   | { readonly kind: "graph-list"; readonly needsRecovery: boolean }
   | { readonly kind: "graph-resume"; readonly module: string; readonly runId: string }
-  | { readonly kind: "graph-cancel"; readonly runId: string }
+  | {
+      readonly kind: "graph-cancel";
+      readonly runId: string;
+      /** Wait until the run is seen to end, up to `timeoutMs`. */
+      readonly wait: boolean;
+      readonly timeoutMs: number;
+    }
   | {
       readonly kind: "graph-recover";
       readonly module: string;
@@ -64,6 +70,8 @@ export type ParseResult =
 
 export const DEFAULT_HEARTBEAT_MS = 5 * 60_000;
 export const DEFAULT_LOCAL_MODEL = "llama3.2";
+/** Covers the 2 s cancel poll plus the executor's 10 s grace for handlers that ignore aborts. */
+export const DEFAULT_CANCEL_WAIT_MS = 30_000;
 const THREE_HOURS = 3 * 3_600_000;
 
 const OPTIONS = {
@@ -85,6 +93,8 @@ const OPTIONS = {
   input: { type: "string" },
   "input-file": { type: "string" },
   "run-id": { type: "string" },
+  wait: { type: "boolean" },
+  timeout: { type: "string" },
   "needs-recovery": { type: "boolean" },
   retry: { type: "boolean" },
   fail: { type: "boolean" },
@@ -212,13 +222,24 @@ function parseGraph(
         ...(values["run-id"] !== undefined && { runId: values["run-id"] }),
       });
     }
-    case "status":
+    case "status": {
+      const args = need(["run-id"]);
+      if (failed(args)) return args;
+      return ok({ kind: "graph-status", runId: args[0] as string });
+    }
     case "cancel": {
       const args = need(["run-id"]);
       if (failed(args)) return args;
+      const timeout =
+        values.timeout === undefined ? DEFAULT_CANCEL_WAIT_MS : parseDuration(values.timeout);
+      if (timeout === undefined || timeout === null) {
+        return usage(`Invalid --timeout "${values.timeout}"; use e.g. 30s or 2m.`);
+      }
       return ok({
-        kind: sub === "status" ? "graph-status" : "graph-cancel",
+        kind: "graph-cancel",
         runId: args[0] as string,
+        wait: values.wait ?? false,
+        timeoutMs: timeout,
       });
     }
     case "list": {

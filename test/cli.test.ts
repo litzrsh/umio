@@ -61,6 +61,16 @@ describe("parseCommandLine", () => {
       runId: "r1",
     });
     expect(command("graph", "status", "r1").command).toEqual({ kind: "graph-status", runId: "r1" });
+    expect(command("graph", "cancel", "r1").command).toEqual({
+      kind: "graph-cancel",
+      runId: "r1",
+      wait: false,
+      timeoutMs: 30_000,
+    });
+    expect(command("graph", "cancel", "r1", "--wait", "--timeout", "2m").command).toMatchObject({
+      wait: true,
+      timeoutMs: 120_000,
+    });
     expect(command("graph", "list", "--needs-recovery").command).toEqual({
       kind: "graph-list",
       needsRecovery: true,
@@ -101,6 +111,7 @@ describe("parseCommandLine", () => {
       [["--bogus"], /Unknown option '--bogus'/],
       [["--heartbeat", "soon"], /Invalid --heartbeat/],
       [["doctor", "--node-timeout", "forever"], /Invalid --node-timeout/],
+      [["graph", "cancel", "r1", "--timeout", "later"], /Invalid --timeout/],
     ] as const;
     for (const [argv, message] of errors) {
       const result = parseCommandLine(argv);
@@ -588,3 +599,41 @@ function modelReply(calls: ToolCallPart[], text = ""): GenerateResult {
     raw: {},
   };
 }
+
+describe("cancel acknowledgments", () => {
+  it("always say whether the cancel is only recorded or confirmed", async () => {
+    const { cancelReportLines } = await import("../src/cli/app.js");
+    const out = { write() {} };
+    const terminal = new Terminal(out, out, {
+      style: plain,
+      quiet: false,
+      heartbeatMs: 0,
+      env: {},
+    });
+    const text = (report: Parameters<typeof cancelReportLines>[0]) =>
+      cancelReportLines(report, terminal).join("\n");
+    expect(
+      text({ runId: "r", outcome: "recorded", via: "control-file", ownerActive: true }),
+    ).toMatch(
+      /Cancel request recorded for run r — not yet confirmed\.[\s\S]*checks every ~2 s[\s\S]*Confirm with `umio graph status r`/,
+    );
+    expect(
+      text({ runId: "r", outcome: "recorded", via: "control-file", ownerActive: false }),
+    ).toMatch(/No process is driving this run right now/);
+    expect(
+      text({ runId: "r", outcome: "recorded", waited: "ended", confirmed: "cancelled" }),
+    ).toMatch(/not yet confirmed[\s\S]*Confirmed: run r is cancelled\./);
+    expect(
+      text({ runId: "r", outcome: "recorded", waited: "ended", confirmed: "completed" }),
+    ).toMatch(/Run r ended completed before the cancel took effect\./);
+    expect(text({ runId: "r", outcome: "already-requested", waited: "timeout" })).toMatch(
+      /already recorded[\s\S]*Not confirmed yet: run r is still running\. The request stays recorded/,
+    );
+    expect(text({ runId: "r", outcome: "cancelled", via: "store" })).toMatch(
+      /^Confirmed: run r is cancelled\./,
+    );
+    expect(text({ runId: "r", outcome: "already-terminal", status: "completed" })).toBe(
+      "Nothing to cancel: run r is already completed.",
+    );
+  });
+});

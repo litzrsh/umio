@@ -27,10 +27,12 @@ import {
   writeStarterConfig,
 } from "./config.js";
 import { runDoctor } from "./doctor.js";
+import { formatDuration } from "./duration.js";
 import { CliError, debugDetails, explain } from "./explain.js";
 import { oneLine, runStatusLabel, turnFooter } from "./format.js";
 import {
-  cancelGraph,
+  type CancelReport,
+  cancelRun,
   defaultStoreFor,
   listSnapshots,
   readInput,
@@ -247,16 +249,24 @@ export async function runGraphCommand(
       }
       return EXIT.ok;
     }
-    const ack = await cancelGraph(dir, command.runId);
-    if (options.json) return json(context, ack);
-    const text = {
-      requested: "Cancel requested; the run's owner stops it within a few seconds.",
-      cancelled: "Cancelled. It had no live owner; nodes left running are now uncertain.",
-      "already-terminal": `Nothing to cancel: the run is already ${ack.status}.`,
-      "not-found": `No run "${command.runId}".`,
-    }[ack.outcome];
-    terminal.line(text);
-    return ack.outcome === "not-found" ? EXIT.error : EXIT.ok;
+    if (command.wait && !options.json) {
+      terminal.note(
+        terminal.style.dim(
+          `Waiting up to ${formatDuration(command.timeoutMs)} for the run to stop…`,
+        ),
+      );
+    }
+    const report = await cancelRun(dir, command.runId, {
+      wait: command.wait,
+      timeoutMs: command.timeoutMs,
+      now,
+    });
+    if (options.json) {
+      json(context, report);
+    } else {
+      for (const line of cancelReportLines(report, terminal)) terminal.line(line);
+    }
+    return cancelExitCode(report);
   }
 
   const located = await loadCliConfig(io.cwd, io.env, options.config);
@@ -341,6 +351,69 @@ export function modelClient(context: Context, config: UmioConfig): ModelClient {
   const alias = context.options.model;
   const effective = alias ? { ...config, defaultModel: requireModel(config, alias) } : config;
   return (context.deps.createModel ?? ((value) => new LLM(value)))(effective);
+}
+
+/** Words for a cancel report: always says whether the cancel is only recorded or confirmed. */
+export function cancelReportLines(report: CancelReport, terminal: Terminal): string[] {
+  const { style } = terminal;
+  const id = report.runId;
+  const lines: string[] = [];
+  switch (report.outcome) {
+    case "not-found":
+      return [`No run "${id}".`];
+    case "already-terminal":
+      return [`Nothing to cancel: run ${id} is already ${report.status}.`];
+    case "cancelled":
+      return [
+        style.green(`Confirmed: run ${id} is cancelled.`) +
+          style.dim(" It had no live owner; nodes left running are now uncertain."),
+      ];
+    case "recorded":
+    case "already-requested":
+      lines.push(
+        `${report.outcome === "recorded" ? "Cancel request recorded" : "A cancel request was already recorded"} for run ${id} — ${style.bold("not yet confirmed")}.`,
+        style.dim(
+          report.ownerActive
+            ? "  The umio process driving it checks every ~2 s, then stops it through the normal cancel path (up to 10 s more for handlers that ignore aborts)."
+            : "  No process is driving this run right now; the request is applied when it is next resumed, recovered or cancelled with the store free.",
+        ),
+      );
+      break;
+    case "requested":
+      lines.push(
+        `Cancel recorded in run ${id} — ${style.bold("not yet confirmed")}.`,
+        style.dim(
+          "  Its previous owner's lease has not expired; `umio graph resume` (or cancel again) finalizes it after that.",
+        ),
+      );
+      break;
+  }
+  if (report.waited === "ended") {
+    lines.push(
+      report.confirmed === "cancelled"
+        ? style.green(`Confirmed: run ${id} is cancelled.`)
+        : style.yellow(
+            `Run ${id} ended ${report.confirmed ?? "(removed)"} before the cancel took effect.${report.confirmed === "needs-recovery" ? " The request stays recorded; `umio graph cancel` again once the store is free finalizes it." : ""}`,
+          ),
+    );
+  } else if (report.waited === "timeout") {
+    lines.push(
+      style.yellow(
+        `Not confirmed yet: run ${id} is still running. The request stays recorded; check with \`umio graph status ${id}\`.`,
+      ),
+    );
+  } else {
+    lines.push(style.dim(`  Confirm with \`umio graph status ${id}\`, or use --wait next time.`));
+  }
+  return lines;
+}
+
+/** 0 when recorded (without --wait) or confirmed; 1 when not found, timed out, or the run ended otherwise. */
+function cancelExitCode(report: CancelReport): number {
+  if (report.outcome === "not-found") return EXIT.error;
+  if (report.waited === "timeout") return EXIT.error;
+  if (report.waited === "ended" && report.confirmed !== "cancelled") return EXIT.error;
+  return EXIT.ok;
 }
 
 function statusCode(status: WorkflowRun["status"]): number {

@@ -58,7 +58,7 @@ export function explain(error: unknown): Explanation {
   if (error instanceof CheckpointStoreLockedError) {
     return withHint(
       error.message,
-      "The file checkpoint store is single-process. Wait for the other umio process to finish, or cancel it with Ctrl+C in its terminal. `umio graph status <run-id>` works meanwhile.",
+      "The file checkpoint store has one writer at a time, so resume and recover must wait until that process ends (run them again then). Meanwhile `umio graph status <run-id>` works, and `umio graph cancel <run-id>` sends that process a cancel request.",
     );
   }
   if (error instanceof LeaseUnavailableError) {

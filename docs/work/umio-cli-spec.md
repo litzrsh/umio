@@ -34,7 +34,7 @@ umio graph run <module> [--input <text>|--input-file <f>] [--run-id <id>]
 umio graph status <run-id>      nodes, owner, and nodes needing recovery
 umio graph list [--needs-recovery]
 umio graph resume <module> <run-id>
-umio graph cancel <run-id>
+umio graph cancel <run-id> [--wait [--timeout <duration>]]
 umio graph recover <module> <run-id> <node-id> (--retry | --fail [msg] | --complete <json> | --complete-file <f>)
 ```
 
@@ -101,4 +101,8 @@ Each error prints one line `error: <what happened>` and one `hint: <what to do>`
 
 ## Outside the MVP
 
-Session persistence, multi-line editing, a full-screen layout, cross-process cancel with the file store (single-process), MCP, and a config editor.
+Session persistence, multi-line editing, a full-screen layout, MCP, and a config editor. Cross-process `resume`/`recover` while another process holds the file store (they fail with a lock error; the store stays single-writer).
+
+## Cross-process cancel (added after the MVP)
+
+`graph cancel` from another process writes `control/<run>.cancel.json` (temp file, fsync, rename) next to the run. The requester never writes run files or leases. The store holder reads the file inside `isCancelRequested`, which the executor polls every `cancelPollIntervalMs` (2 s) on its own timer and before each attempt starts, and records the request in the run under its own mutex, so the run keeps a single writer and the cancel goes through the executor's fenced path. The request carries the run's `instance` (random per `create()`), so it cannot match a later run with the same ID. Requests for terminal, missing or other-instance runs are discarded on read and swept by `open()`; temp files older than 60 s from crashed requesters are swept too. The CLI reports `recorded` / `already-requested` / `requested` (not confirmed) apart from `cancelled` and, with `--wait`, the final status it observed.

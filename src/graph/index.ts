@@ -6,6 +6,7 @@ export {
   defaultTask,
 } from "./agent-node.js";
 export {
+  type CancelRequestReceipt,
   FileCheckpointStore,
   type FileCheckpointStoreOptions,
   type StoredRunSnapshot,

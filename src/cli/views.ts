@@ -19,7 +19,7 @@ import {
   truncate,
 } from "./format.js";
 import type { GraphRunView } from "./graph.js";
-import { ownership, type StoreHolder } from "./graph.js";
+import { cancelState, ownership, type StoreHolder } from "./graph.js";
 import type { Terminal } from "./terminal.js";
 
 export class TerminalChatView implements ChatView {
@@ -234,9 +234,13 @@ export function runJson(
     definitionVersion: record.definitionVersion,
     status: record.status,
     ...(record.error && { error: record.error }),
-    ...(snapshot.lease !== undefined || snapshot.cancelRequested !== undefined
-      ? { owner: ownership(snapshot as StoredRunSnapshot, now, holder) }
-      : {}),
+    ...(snapshot.instance !== undefined && {
+      owner: ownership(snapshot as StoredRunSnapshot, now, holder),
+      cancelRequest: cancelState(snapshot as StoredRunSnapshot),
+      ...(snapshot.pendingCancelRequest && {
+        cancelRequestedAt: new Date(snapshot.pendingCancelRequest.requestedAt).toISOString(),
+      }),
+    }),
     nodes: Object.values(record.nodes).map((node) => ({
       nodeId: node.nodeId,
       status: node.status,
