@@ -7,7 +7,7 @@ const dtsOptions = { compilerOptions: { ignoreDeprecations: "6.0" } };
 export default defineConfig([
   {
     // ESM: the library and the `umio` CLI share chunks, so a workflow module
-    // that imports "umio" gets the same classes as the CLI running it.
+    // that imports "@litzrsh/umio" gets the same classes as the CLI running it.
     entry: { index: "src/index.ts", cli: "src/cli/main.ts" },
     format: ["esm"],
     splitting: true,

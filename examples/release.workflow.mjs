@@ -8,7 +8,7 @@
 // With the file store this runs on one machine; with a PostgreSQL store
 // (see examples/umio.postgres.config.json) anyone sharing the database can
 // approve while the run is paused, from any machine.
-import { Agent, agentNode } from "umio";
+import { Agent, agentNode } from "@litzrsh/umio";
 
 const SIX_HOURS = 6 * 60 * 60 * 1000;
 
@@ -16,7 +16,7 @@ const SIX_HOURS = 6 * 60 * 60 * 1000;
 const from = (context, bodyId) =>
   Object.entries(context.predecessors).find(([key]) => key.endsWith(`/${bodyId}`))?.[1];
 
-/** @param {{ llm: import("umio").ModelClient }} context */
+/** @param {{ llm: import("@litzrsh/umio").ModelClient }} context */
 export default ({ llm }) => {
   const planner = new Agent({
     name: "Planner",

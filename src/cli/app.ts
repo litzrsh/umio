@@ -938,7 +938,7 @@ export function readVersion(): string {
         name?: string;
         version?: string;
       };
-      if (pkg.name === "umio" && pkg.version) return pkg.version;
+      if (pkg.name === "@litzrsh/umio" && pkg.version) return pkg.version;
     } catch {
       // try the next location
     }

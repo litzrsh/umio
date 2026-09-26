@@ -1,0 +1,81 @@
+name: Release
+
+# Publishes to npm when a version tag is pushed: git tag v0.1.0 && git push origin v0.1.0
+# (or `npm version patch && git push --follow-tags`). See docs/releasing.md.
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write # GitHub release
+  id-token: write # npm trusted publishing (OIDC) and provenance
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # Add protection rules (e.g. required reviewers) to this environment in the
+    # repository settings; name it in the npm trusted-publisher settings too.
+    environment: npm
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: umio
+          POSTGRES_PASSWORD: umio
+          POSTGRES_DB: umio
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U umio -d umio"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          # npm 11.5.1 or newer is needed for trusted publishing; Node 24 ships it.
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          cache: npm
+      - run: npm ci
+
+      - name: Check the tag matches package.json
+        run: |
+          version=$(node -p "require('./package.json').version")
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match package.json version $version"
+            exit 1
+          fi
+
+      - name: Typecheck, lint, schema, tests, package checks
+        run: npm run release:check
+      - name: PostgreSQL store tests
+        run: npm run test:postgres
+        env:
+          UMIO_TEST_POSTGRES_URL: postgres://umio:umio@localhost:5432/umio
+
+      - name: Publish to npm
+        run: |
+          # Prereleases (1.2.0-rc.1) go to the "next" dist-tag, never "latest".
+          case "$GITHUB_REF_NAME" in
+            *-*) npm publish --tag next ;;
+            *) npm publish ;;
+          esac
+        env:
+          # Only for the first release, before trusted publishing is set up
+          # (docs/releasing.md). With a trusted publisher npm uses OIDC and
+          # this secret should not exist.
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Create the GitHub release
+        run: |
+          flags=(--generate-notes --verify-tag)
+          case "$GITHUB_REF_NAME" in *-*) flags+=(--prerelease) ;; esac
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" "${flags[@]}"
+        env:
+          GH_TOKEN: ${{ github.token }}

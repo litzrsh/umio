@@ -37,16 +37,25 @@
 
 ## Installation
 
-The package is not published yet. Build from source:
-
 ```bash
-npm install
-npm run build
+npm install @litzrsh/umio
+npm install pg        # only for the PostgreSQL checkpoint store
 ```
 
-Requires Node.js 20 or newer.
+Requires Node.js 20.18.1 or newer. The package ships ESM and CommonJS builds with type declarations, and the `umio` command:
 
-This also builds the `umio` command (`dist/cli.js`, registered under `bin` in `package.json`). To use it from anywhere, run `npm link` in the repository; without linking, run `node dist/cli.js …`, or `npm run cli -- …` to run it from source.
+```bash
+npx umio --help                # in a project that depends on @litzrsh/umio
+npm install -g @litzrsh/umio   # or globally, for `umio` anywhere
+```
+
+```typescript
+import { LLM, Agent } from "@litzrsh/umio";
+```
+
+The JSON Schema for `umio.config.json` is included: point `$schema` at `./node_modules/@litzrsh/umio/schema/umio.config.schema.json`, or import it as `@litzrsh/umio/schema.json`.
+
+To work on umio itself, clone the repository and run `npm install && npm run build`. `npm run cli -- …` runs the command from source. Releases are described in [`docs/releasing.md`](docs/releasing.md).
 
 ---
 
@@ -130,7 +139,7 @@ A workflow module is an ES module whose default export is a `WorkflowDefinition`
 
 ```js
 // review.workflow.mjs (see examples/review.workflow.mjs)
-import { Agent, agentNode } from "umio";
+import { Agent, agentNode } from "@litzrsh/umio";
 
 export default ({ llm }) => ({
   graph: {
@@ -183,7 +192,7 @@ Exit codes for `run`, `resume` and `status`: 0 completed (or still running), 1 f
   - When no other process holds the store, `cancel` goes through the executor's `cancel()` directly.
 - **Ctrl+C during `run` or `resume`:** the first press cancels the run explicitly. The cancel is recorded, and running nodes get their grace period. A second press exits at once without finalizing. `graph status` then shows the run as interrupted, and `graph resume` marks its running nodes uncertain instead of running them again. SIGTERM behaves like the second press.
 - **Nodes needing recovery:** `status` and `run` list every `uncertain` node with its reason, attempt and idempotency key, say plainly that its side effects may have happened, and print the three explicit `recover` commands. umio never picks one, and never retries an uncertain node automatically.
-- The module must import `umio` from the same installation as the command (run the CLI with `npx umio` in the project that depends on it), so both share one copy of the library.
+- The module must import `@litzrsh/umio` from the same installation as the command (run the CLI with `npx umio` in the project that depends on it), so both share one copy of the library.
 - The module must be `.mjs`/`.js` ESM. A `.ts` module needs Node's type stripping (Node 22.18 or newer).
 - `--model <alias>` becomes the default model for agents that don't name one.
 
@@ -316,7 +325,7 @@ Any string value can use `${VAR}` or `${VAR:-fallback}`. A missing variable with
 ## Usage
 
 ```typescript
-import { LLM } from "umio";
+import { LLM } from "@litzrsh/umio";
 
 const llm = await LLM.fromFile(); // ./umio.config.json
 
@@ -348,7 +357,7 @@ Events are `text-delta`, `tool-call` (emitted once the call's arguments are comp
 
 ```typescript
 import { z } from "zod";
-import { tool } from "umio";
+import { tool } from "@litzrsh/umio";
 
 const getWeather = tool({
   name: "get_weather",
@@ -370,7 +379,7 @@ const getWeather = tool({
 ### Running the tool loop
 
 ```typescript
-import { LLM, runToolLoop } from "umio";
+import { LLM, runToolLoop } from "@litzrsh/umio";
 
 const llm = await LLM.fromFile();
 const result = await runToolLoop(llm, {
@@ -423,7 +432,7 @@ await runToolLoop(llm, {
 `Toolset` is a collection with unique names. Use `pick()` and `omit()` to give a component a restricted view of the same tools; both throw on unknown names to catch typos.
 
 ```typescript
-import { Toolset } from "umio";
+import { Toolset } from "@litzrsh/umio";
 
 const all = new Toolset([getWeather, searchDocs, deleteFile]);
 const readOnly = all.omit(["delete_file"]);
@@ -434,7 +443,7 @@ const readOnly = all.omit(["delete_file"]);
 `composeHooks()` merges independent hook sets. `limitToolOutput()` condenses oversized tool results (keeping the start and the end) before they reach the model. That matters because tool results are resent on every later step of a loop.
 
 ```typescript
-import { composeHooks, limitToolOutput } from "umio";
+import { composeHooks, limitToolOutput } from "@litzrsh/umio";
 
 hooks: composeHooks(approvalHooks, loggingHooks, limitToolOutput({ maxChars: 8000 })),
 ```
@@ -483,7 +492,7 @@ Explicit options win over harness defaults: `maxSteps` passed to `runToolLoop` o
 ### Agents
 
 ```typescript
-import { Agent } from "umio";
+import { Agent } from "@litzrsh/umio";
 
 const researcher = new Agent({
   name: "Researcher",
@@ -502,7 +511,7 @@ An agent's system prompt is its name, role and instructions. Shared context from
 ### Workflows
 
 ```typescript
-import { Workflow } from "umio";
+import { Workflow } from "@litzrsh/umio";
 
 const run = await new Workflow({ llm })
   .step(researcher)                  // input: the run input
@@ -593,7 +602,7 @@ Read references/checklist.md when checking test coverage.
 - **Identity.** Each skill has the SHA-256 `digest` of its `SKILL.md`. A document that changes after the catalog was loaded is refused (`SkillChangedError`); load a new catalog to pick it up. `prepared.usage()` (immutable) lists the documents and files used, with digests; `skillManifest(usage)` turns that into JSON, and `catalog.verify(manifest)` checks that the content is unchanged.
 
 ```typescript
-import { Agent, loadSkillCatalog, withSkills } from "umio";
+import { Agent, loadSkillCatalog, withSkills } from "@litzrsh/umio";
 
 const catalog = await loadSkillCatalog({ roots: ["./skills"], baseDir: process.cwd() });
 const reviewer = new Agent({ name: "Reviewer", role: "Reviews changes." });
@@ -636,7 +645,7 @@ prepared?.usage();   // [{ name: "code-review", documentDigest, resources: [{ pa
 `WorkflowExecutor` runs a directed acyclic graph of nodes: branches, parallel paths and joins, with retries, timeouts and cancellation. Every change to a run is checkpointed to a `CheckpointStore`, and an interrupted run can be resumed by another process. The design and its invariants are in `docs/work/umio-graph-workflow-plan.md`.
 
 ```typescript
-import { agentNode, WorkflowExecutor, type WorkflowDefinition } from "umio";
+import { agentNode, WorkflowExecutor, type WorkflowDefinition } from "@litzrsh/umio";
 
 const definition: WorkflowDefinition = {
   graph: {
@@ -793,7 +802,7 @@ run = await executor.resume(definition, "release-42");                        //
 
 ```typescript
 import pg from "pg";
-import { PostgresCheckpointStore, WorkflowExecutor } from "umio";
+import { PostgresCheckpointStore, WorkflowExecutor } from "@litzrsh/umio";
 
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
 await PostgresCheckpointStore.migrate(pool);
@@ -844,7 +853,7 @@ Each group is a function returning ordinary `Tool`s, so they combine with toolse
 | `utilityTools()` | `current_time`, `calculate` | `calculate` uses its own parser, never `eval`. |
 
 ```typescript
-import { Agent, commandTool, fileTools, sqlTools, webTools } from "umio";
+import { Agent, commandTool, fileTools, sqlTools, webTools } from "@litzrsh/umio";
 import { z } from "zod";
 
 const codeSearch = commandTool({
@@ -885,7 +894,7 @@ Declare project toolsets in `umio.config.json`. Relative paths (`root`, `cwd`) r
 ```
 
 ```typescript
-import { createToolsets } from "umio";
+import { createToolsets } from "@litzrsh/umio";
 
 const toolsets = createToolsets(llm.config); // { repo: Toolset, docs: Toolset, ... }
 const reviewer = new Agent({ name: "Reviewer", role: "...", tools: toolsets.repo });
@@ -910,7 +919,7 @@ createToolsets(llm.config, registry);
 Middleware wraps every model call made through `LLM`, for both `generate()` and `stream()`, including the calls made inside `runToolLoop()`. The call path is: middleware (first registered = outermost) → response cache → provider.
 
 ```typescript
-import { LLM, type Middleware } from "umio";
+import { LLM, type Middleware } from "@litzrsh/umio";
 
 const timing: Middleware = {
   name: "timing",
@@ -939,7 +948,7 @@ Each hook is optional:
 ### Prompt translator
 
 ```typescript
-import { promptTranslator } from "umio";
+import { promptTranslator } from "@litzrsh/umio";
 
 llm.use(
   promptTranslator({
@@ -1053,6 +1062,9 @@ npm run lint         # biome check (npm run format to auto-fix)
 npm test             # vitest run (the PostgreSQL store's contract suite runs on PGlite, in process)
 npm run test:postgres  # multi-client and multi-process tests against a real server (UMIO_TEST_POSTGRES_URL)
 npm run schema       # regenerate schema/umio.config.schema.json from the Zod schema
+npm run schema:check # fail if the committed schema is out of date
+npm run check:package  # build, then publint and "are the types wrong" on the packed tarball
+npm run release:check  # everything the release workflow checks before publishing (docs/releasing.md)
 npm run example -- local "Hello"   # call a model from ./umio.config.json
 npm run example:tools -- local     # streaming tool loop (UMIO_CONFIG=path to use another config)
 npm run example:workflow -- local  # two-agent workflow with ADRs

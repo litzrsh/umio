@@ -1,11 +1,11 @@
 // A workflow module for the umio CLI:
 //   umio graph run examples/review.workflow.mjs --input "Store uploads on the web server's disk."
 // The default export receives the CLI's model client and config, so agent
-// nodes share its request limits. Import "umio" as a package (not from source)
+// nodes share its request limits. Import "@litzrsh/umio" as a package (not from source)
 // so the module and the CLI use the same library instance.
-import { Agent, agentNode } from "umio";
+import { Agent, agentNode } from "@litzrsh/umio";
 
-/** @param {{ llm: import("umio").ModelClient, config: import("umio").UmioConfig }} context */
+/** @param {{ llm: import("@litzrsh/umio").ModelClient, config: import("@litzrsh/umio").UmioConfig }} context */
 export default ({ llm }) => {
   const agent = (name, role) =>
     new Agent({ name, role, instructions: "Answer in at most 3 short bullet points." });

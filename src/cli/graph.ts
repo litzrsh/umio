@@ -69,7 +69,7 @@ export async function loadWorkflow(
       {
         hint:
           extname(file) === ".ts"
-            ? "TypeScript modules need Node ≥ 22.18 (type stripping) and must import umio as a package, not from source."
+            ? "TypeScript modules need Node ≥ 22.18 (type stripping) and must import @litzrsh/umio as a package, not from source."
             : "The module must be an ES module whose default export is a WorkflowDefinition or a function returning one.",
         cause: error,
       },

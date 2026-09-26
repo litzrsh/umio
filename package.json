@@ -1,8 +1,31 @@
 {
-  "name": "umio",
+  "name": "@litzrsh/umio",
   "version": "0.1.0",
-  "description": "TypeScript-first AI orchestration library for multi-agent workflows.",
+  "description": "TypeScript-first AI orchestration: provider-neutral LLM calls, tools, agents, durable graph workflows and skills, with a CLI. Built for slow local models.",
+  "keywords": [
+    "ai",
+    "llm",
+    "agents",
+    "orchestration",
+    "workflow",
+    "tool-calling",
+    "anthropic",
+    "openai",
+    "ollama",
+    "local-llm",
+    "typescript",
+    "cli"
+  ],
   "license": "Apache-2.0",
+  "author": "litzrsh",
+  "homepage": "https://github.com/litzrsh/umio#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/litzrsh/umio.git"
+  },
+  "bugs": {
+    "url": "https://github.com/litzrsh/umio/issues"
+  },
   "type": "module",
   "engines": {
     "node": ">=20.18.1"
@@ -11,7 +34,7 @@
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "bin": {
-    "umio": "./dist/cli.js"
+    "umio": "dist/cli.js"
   },
   "exports": {
     ".": {
@@ -31,6 +54,11 @@
     "dist",
     "schema"
   ],
+  "sideEffects": false,
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
   "scripts": {
     "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsup",
     "dev": "tsup --watch",
@@ -45,10 +73,13 @@
     "example:graph": "tsx examples/graph.ts",
     "test:watch": "vitest",
     "schema": "tsx scripts/generate-schema.ts",
-    "prepublishOnly": "npm run schema && npm run build",
     "cli": "tsx src/cli/main.ts",
     "test:postgres": "UMIO_TEST_POSTGRES_URL=${UMIO_TEST_POSTGRES_URL:-postgres://umio:umio@localhost:55432/umio} vitest run test/checkpoint-postgres-server.test.ts",
-    "example:skills": "tsx examples/skills.ts"
+    "example:skills": "tsx examples/skills.ts",
+    "schema:check": "tsx scripts/generate-schema.ts --check",
+    "check:package": "publint --strict && attw --pack . --profile node16",
+    "prepack": "npm run build",
+    "release:check": "npm run typecheck && npm run lint && npm run schema:check && npm test && npm run check:package"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.128.0",
@@ -66,11 +97,13 @@
     }
   },
   "devDependencies": {
+    "@arethetypeswrong/cli": "^0.18.5",
     "@biomejs/biome": "^2.5.14",
     "@electric-sql/pglite": "^0.5.8",
     "@types/node": "^26.6.3",
     "@types/pg": "^8.23.1",
     "pg": "^8.23.0",
+    "publint": "^0.3.24",
     "tsup": "^8.5.1",
     "tsx": "^4.23.15",
     "typescript": "^6.0.3",
