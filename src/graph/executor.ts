@@ -911,7 +911,9 @@ export class WorkflowExecutor {
       for (const top of definition.graph.nodes) {
         const loop = top.loop;
         const state = record.nodes[top.id];
-        if (!loop || state?.status !== "running" || !state.loop || halt) continue;
+        // A loop that became uncertain (or a failure) stops all further progress here.
+        if (halt || hasUncertain(record)) break;
+        if (!loop || state?.status !== "running" || !state.loop) continue;
         const { iteration, decisions } = state.loop;
         if (decisions.length >= iteration || iterationState(top, record, iteration) !== "done") {
           continue;
@@ -1058,12 +1060,16 @@ export class WorkflowExecutor {
         if (!halt && !hasUncertain(record)) {
           if (decisionsDue) await applyDecisions();
           await advanceLoops();
+          // Applying decisions or advancing loops may have failed or parked a
+          // node (a loop result over its limit is uncertain): then nothing new
+          // starts, and attempts already running settle and park as usual.
+          const blocked = () => halt !== undefined || cancelRequested || hasUncertain(record);
           // Approval and loop nodes change the record without running code;
           // readiness is recomputed after each such change.
-          for (let changed = true; changed && !halt && !cancelRequested; ) {
+          for (let changed = true; changed && !blocked(); ) {
             changed = false;
             for (const nodeId of readyNodes(view.graph, record, now())) {
-              if (halt || cancelRequested) break;
+              if (blocked()) break;
               const kind = view.info.get(nodeId)?.kind ?? "task";
               if (kind !== "task") {
                 if (await this.cancelPending(runId)) {

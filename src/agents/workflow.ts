@@ -5,6 +5,9 @@ import { UmioError } from "../errors.js";
 import { WorkflowExecutor } from "../graph/executor.js";
 import type { JsonValue, NodeHandler, WorkflowDefinition } from "../graph/types.js";
 import type { ModelClient, Usage } from "../llm/types.js";
+import { type SkillBinding, withSkills } from "../skills/agent.js";
+import { skillManifest } from "../skills/catalog.js";
+import type { SkillManifest } from "../skills/types.js";
 import type { ToolHooks } from "../tools/execute.js";
 import { sumUsage, type ToolLoopEvent } from "../tools/loop.js";
 import {
@@ -13,7 +16,7 @@ import {
   loadAdrContext,
   resolveAdrOptions,
 } from "./adr-context.js";
-import type { Agent, AgentResult } from "./agent.js";
+import type { Agent, AgentResult, AgentRunOptions } from "./agent.js";
 
 export type { AdrWorkflowOptions } from "./adr-context.js";
 
@@ -28,6 +31,11 @@ export interface WorkflowOptions {
   state?: KVStore;
   /** Tool hooks applied to every agent. */
   hooks?: ToolHooks;
+  /**
+   * Skills for every step (a catalog and a selection), prepared afresh for
+   * each step. A step's own `skills` replaces this; selections are never merged.
+   */
+  skills?: SkillBinding;
   stream?: boolean;
   onEvent?(event: WorkflowEvent): void | Promise<void>;
   signal?: AbortSignal;
@@ -48,6 +56,8 @@ export interface StepOptions {
   name?: string;
   /** The task for the agent. Defaults to the previous step's output. */
   input?: string | ((context: StepContext) => string | Promise<string>);
+  /** Replaces the workflow's `skills` for this step; `false` disables them. */
+  skills?: SkillBinding | false;
 }
 
 export interface WorkflowStepResult {
@@ -55,6 +65,8 @@ export interface WorkflowStepResult {
   agent: string;
   input: string;
   result: AgentResult;
+  /** The skill documents and files this step used, when it had skills. */
+  skills?: SkillManifest;
 }
 
 export interface WorkflowResult {
@@ -79,6 +91,7 @@ interface Step {
   name: string;
   agent: Agent;
   input: StepOptions["input"];
+  skills: StepOptions["skills"];
 }
 
 /** Runs agents one after another, each building on the previous output. */
@@ -92,7 +105,7 @@ export class Workflow {
     if (this.steps.some((step) => step.name === name)) {
       throw new UmioError(`Duplicate step name "${name}". Pass { name } to tell the steps apart.`);
     }
-    this.steps.push({ name, agent, input: options.input });
+    this.steps.push({ name, agent, input: options.input, skills: options.skills });
     return this;
   }
 
@@ -125,7 +138,7 @@ export class Workflow {
           const stepInput = await this.stepInput(step, { input, previous, outputs, state });
           await onEvent?.({ type: "step-start", ...meta, input: stepInput });
 
-          const result = await step.agent.run(stepInput, {
+          const runOptions: AgentRunOptions = {
             llm,
             ...(adrContext && { context: [adrContext] }),
             extraTools: adrToolsFor(adr, async (record) => {
@@ -141,11 +154,25 @@ export class Workflow {
             ...(onEvent && {
               onEvent: (event) => onEvent({ type: "agent-event", ...meta, event }),
             }),
-          });
+          };
+          // Prepared per step, so read budgets and activation never leak between steps.
+          const binding = step.skills === false ? undefined : (step.skills ?? this.options.skills);
+          const withStepSkills = binding
+            ? await withSkills(step.agent, runOptions, binding)
+            : { options: runOptions };
+          const result = await step.agent.run(stepInput, withStepSkills.options);
 
           outputs[step.name] = result.text;
           previous = result.text;
-          steps.push({ name: step.name, agent: step.agent.name, input: stepInput, result });
+          steps.push({
+            name: step.name,
+            agent: step.agent.name,
+            input: stepInput,
+            result,
+            ...(withStepSkills.prepared && {
+              skills: skillManifest(withStepSkills.prepared.usage()),
+            }),
+          });
           await onEvent?.({ type: "step-finish", ...meta, result });
           // Only JSON is checkpointed; the full AgentResult stays in `steps`.
           return { text: result.text, usage: JSON.parse(JSON.stringify(result.usage)) };

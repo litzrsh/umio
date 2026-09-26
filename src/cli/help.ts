@@ -8,6 +8,8 @@ Usage
   umio config                 show the resolved config (secrets masked)
   umio models                 list model aliases
   umio tools                  list configured tools
+  umio skills [list]          validate and list the skills the config permits
+  umio skills show <name>     a permitted skill's instructions and digest
   umio graph <subcommand>     run and manage graph workflows (umio help graph)
 
 Options
@@ -15,6 +17,8 @@ Options
   -m, --model <alias>     model alias (default: the config's defaultModel)
       --tools <a,b>       toolsets to offer (default: all configured; "none" for no tools)
   -y, --yes               run tools that may change things without asking
+      --skill <name>      activate a permitted skill (repeatable; replaces the configured activation)
+      --no-skills         no skill instructions or skill tools for this run
       --store <dir|url>   graph checkpoint store: a directory, or a postgres:// URL
                           (default: graph.checkpoint in the config, else .umio/runs next to it)
       --json              machine-readable output (ask, doctor, config, models, tools, graph)
@@ -47,7 +51,7 @@ Commands
 A model call to a local server may run for hours without output. The status
 line shows the elapsed time; silence is not an error.
 `,
-  ask: `umio ask [prompt] — one answer, for scripts
+  ask: `umio ask [prompt] [--skill <name>…] [--no-skills] — one answer, for scripts
 
 The prompt is the arguments, or stdin when there are none. Model text goes to
 stdout; tool activity and heartbeats to stderr. Tools not marked read-only are
@@ -66,6 +70,28 @@ Checks the config, the model alias, provider credentials, that local servers
 answer and list the configured models, and that no local provider ends a
 request before --node-timeout (default 3h; "none" for no limit). Cloud APIs are
 never called. Exit code 1 if any check fails.
+`,
+  skills: `umio skills — reusable agent instructions
+
+  umio skills [list]         validate the configured roots; list permitted skills
+  umio skills show <name>    a permitted skill's instructions and SHA-256 digest
+  umio ask --skill <name> "…"   activate a skill for this run (repeat for more)
+  umio ask --no-skills "…"      run without skills
+
+A skill is a directory with a SKILL.md (YAML frontmatter with name and
+description, then Markdown instructions) and optional text files. Configure
+them in umio.config.json:
+
+  "skills": { "roots": ["./skills"], "include": ["code-review"],
+              "activate": ["code-review"], "allowModelSelection": false }
+
+Only skills listed in include can be used; --skill chooses among them but
+never adds one. Activated skills go into the system prompt; with
+allowModelSelection the model sees the other permitted skills' summaries and
+may load one with skills_load. skills_read reads a file of an active skill.
+Both tools are read-only. A skill never grants tools, permissions or approvals:
+scripts it mentions run only through a tool you configured, with its usual
+confirmation. In chat, skills are prepared afresh every turn.
 `,
   graph: `umio graph — graph workflows
 

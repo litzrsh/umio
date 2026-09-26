@@ -5,6 +5,7 @@
  */
 import { Agent } from "../agents/agent.js";
 import type { GenerateResult, ModelClient, ToolCallPart } from "../llm/types.js";
+import { type SkillBinding, withSkills } from "../skills/agent.js";
 import type { ToolCallOverride, ToolExecution } from "../tools/execute.js";
 import type { ToolLoopResult } from "../tools/loop.js";
 import type { Tool } from "../tools/tool.js";
@@ -36,6 +37,11 @@ export interface ChatTurnOptions {
    * (non-interactive without --yes): such calls are declined.
    */
   readonly approve?: (call: ToolCallPart, tool: Tool) => Promise<Approval>;
+  /**
+   * Skills, prepared afresh for this turn: activation is never carried over
+   * from earlier turns, though skill text they loaded stays in the transcript.
+   */
+  readonly skills?: SkillBinding;
 }
 
 export type ChatTurnOutcome =
@@ -90,43 +96,48 @@ export async function runChatTurn(
 
   view.waiting();
   try {
-    const result = await agent.run([...turn.base, turn.userMessage], {
-      llm: options.llm,
-      stream: true,
-      signal,
-      hooks: {
-        beforeToolCall: (call, tool) =>
-          serial(async () => {
-            if (!tool) return undefined; // the loop reports unknown tools to the model
-            if (signal.aborted)
-              return { content: "Not run: the turn was cancelled.", isError: true };
-            const override = await decide(call, tool);
-            if (!override) {
-              turn.toolStarted(call.id);
-              view.toolStarted(call);
-            }
-            return override;
-          }),
+    const { options: runOptions } = await withSkills(
+      agent,
+      {
+        llm: options.llm,
+        stream: true,
+        signal,
+        hooks: {
+          beforeToolCall: (call, tool) =>
+            serial(async () => {
+              if (!tool) return undefined; // the loop reports unknown tools to the model
+              if (signal.aborted)
+                return { content: "Not run: the turn was cancelled.", isError: true };
+              const override = await decide(call, tool);
+              if (!override) {
+                turn.toolStarted(call.id);
+                view.toolStarted(call);
+              }
+              return override;
+            }),
+        },
+        onEvent: (event) => {
+          switch (event.type) {
+            case "text-delta":
+              view.text(event.text);
+              break;
+            case "finish":
+              turn.modelFinished(event.result);
+              view.modelFinished(event.result);
+              break;
+            case "tool-result":
+              turn.toolFinished(event.execution);
+              view.toolFinished(event.execution);
+              break;
+            case "step-finish":
+              if (event.step.toolExecutions.length > 0) view.waiting(); // the next model call
+              break;
+          }
+        },
       },
-      onEvent: (event) => {
-        switch (event.type) {
-          case "text-delta":
-            view.text(event.text);
-            break;
-          case "finish":
-            turn.modelFinished(event.result);
-            view.modelFinished(event.result);
-            break;
-          case "tool-result":
-            turn.toolFinished(event.execution);
-            view.toolFinished(event.execution);
-            break;
-          case "step-finish":
-            if (event.step.toolExecutions.length > 0) view.waiting(); // the next model call
-            break;
-        }
-      },
-    });
+      options.skills,
+    );
+    const result = await agent.run([...turn.base, turn.userMessage], runOptions);
     session.completeTurn(result);
     return { status: "completed", result };
   } catch (error) {

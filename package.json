@@ -47,12 +47,14 @@
     "schema": "tsx scripts/generate-schema.ts",
     "prepublishOnly": "npm run schema && npm run build",
     "cli": "tsx src/cli/main.ts",
-    "test:postgres": "UMIO_TEST_POSTGRES_URL=${UMIO_TEST_POSTGRES_URL:-postgres://umio:umio@localhost:55432/umio} vitest run test/checkpoint-postgres-server.test.ts"
+    "test:postgres": "UMIO_TEST_POSTGRES_URL=${UMIO_TEST_POSTGRES_URL:-postgres://umio:umio@localhost:55432/umio} vitest run test/checkpoint-postgres-server.test.ts",
+    "example:skills": "tsx examples/skills.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.128.0",
     "openai": "^7.23.0",
     "undici": "^7.30.0",
+    "yaml": "^2.9.1",
     "zod": "^4.6.5"
   },
   "peerDependencies": {

@@ -1,6 +1,6 @@
 # Umio Skills Design Proposal
 
-- Status: Proposal; the APIs and configuration below are not implemented.
+- Status: Phases 1–3 implemented, plus the manifest API of phase 4 (`skillManifest`, `SkillCatalog.verify`); automatic verification on graph retry/resume is not implemented. Implementation record: [`docs/works/2026-09-27-010113-skills-feature.md`](../works/2026-09-27-010113-skills-feature.md).
 - Baseline: Existing `Agent`, `Toolset`, tool loop, sequential `Workflow`, and graph `agentNode` APIs.
 - Goal: Add reusable, file-based agent instructions and supporting resources without coupling skills to a model provider or replacing the execution engine.
 

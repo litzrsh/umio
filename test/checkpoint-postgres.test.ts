@@ -1,5 +1,10 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { PostgresCheckpointStore, postgresSchemaSql, type WorkflowRun } from "../src/index.js";
+import {
+  PostgresCheckpointStore,
+  postgresSchemaSql,
+  type RunListCursor,
+  type WorkflowRun,
+} from "../src/index.js";
 import { checkpointStoreContract } from "./checkpoint-contract.js";
 import { pglite, uniquePrefix } from "./support/postgres.js";
 
@@ -97,5 +102,112 @@ describe("PostgresCheckpointStore (PGlite)", () => {
   it("rejects unsafe identifiers", () => {
     expect(() => postgresSchemaSql({ tablePrefix: "x; drop table y" })).toThrow(/tablePrefix/);
     expect(() => new PostgresCheckpointStore({ client: db, schema: "A-B" })).toThrow(/schema/);
+  });
+
+  describe("listing is complete and paginated (fix 2026-09-27 #3)", () => {
+    const waiting = (
+      runId: string,
+      status: WorkflowRun["status"],
+      updatedAt: number,
+    ): WorkflowRun => ({
+      ...run,
+      schemaVersion: 2,
+      runId,
+      status,
+      updatedAt,
+      nodes: {
+        gate: {
+          nodeId: "gate",
+          status: "waiting",
+          attempt: 0,
+          approval: {
+            requestId: `req-${runId}`,
+            requestedAt: 1,
+            title: "Go?",
+            context: [],
+            onReject: "fail",
+          },
+        },
+      },
+    });
+
+    async function seeded(extra: WorkflowRun[], completed = 1_000) {
+      const tablePrefix = uniquePrefix();
+      await PostgresCheckpointStore.migrate(db, { tablePrefix });
+      const store = new PostgresCheckpointStore({ client: db, tablePrefix, now: () => 0 });
+      for (const item of extra) await store.create(item, "o", 1);
+      // Newer, unrelated runs: more than a page, more than the old 1 000-row default.
+      await db.query(
+        `INSERT INTO ${tablePrefix}runs (run_id, instance, record, schema_version, workflow_id, status,
+                                         revision, created_at, updated_at)
+         SELECT 'done-' || lpad(i::text, 5, '0'), 'i', json_build_object(
+                  'schemaVersion', 1, 'runId', 'done-' || lpad(i::text, 5, '0'), 'workflowId', 'wf',
+                  'definitionVersion', '1', 'definitionHash', 'h', 'status', 'completed', 'input', null,
+                  'nodes', '{}'::json, 'edges', '{}'::json, 'revision', 0, 'createdAt', 0,
+                  'updatedAt', 10000 + i),
+                1, 'wf', 'completed', 0, 0, 10000 + i
+         FROM generate_series(1, $1::int) AS i`,
+        [completed],
+      );
+      return store;
+    }
+
+    it("finds an old waiting approval behind 1 000 newer runs, in running, paused and recovery runs", async () => {
+      const store = await seeded([
+        waiting("old-paused", "paused", 5),
+        waiting("old-running", "running", 6),
+        waiting("old-recovery", "needs-recovery", 7),
+        // A terminal run is never awaiting approval, whatever its nodes say.
+        waiting("old-cancelled", "cancelled", 8),
+      ]);
+      expect((await store.snapshots()).length).toBe(1_004);
+      const approvals = await store.snapshots({ awaitingApproval: true });
+      expect(approvals.map((item) => item.record.runId)).toEqual([
+        "old-recovery",
+        "old-running",
+        "old-paused",
+      ]);
+      const recovery = await store.snapshots({ status: "needs-recovery" });
+      expect(recovery.map((item) => item.record.runId)).toEqual(["old-recovery"]);
+      await expect(store.snapshot("old-paused")).resolves.toMatchObject({
+        record: { runId: "old-paused" },
+      });
+    });
+
+    it("pages deterministically, without duplicates or gaps, including runs with equal timestamps", async () => {
+      // 30 matching runs, ten sharing each timestamp, behind 1 000 others.
+      const extra = Array.from({ length: 30 }, (_, index) =>
+        waiting(`w-${String(index).padStart(2, "0")}`, "paused", 100 + Math.floor(index / 10)),
+      );
+      const store = await seeded(extra);
+      const seen: string[] = [];
+      let after: RunListCursor | undefined;
+      let pages = 0;
+      do {
+        const page = await store.listRuns({
+          awaitingApproval: true,
+          limit: 7,
+          ...(after && { after }),
+        });
+        seen.push(...page.runs.map((item) => item.record.runId));
+        after = page.next;
+        pages += 1;
+      } while (after);
+      expect(pages).toBe(5);
+      expect(new Set(seen).size).toBe(30);
+      // Newest first, ties by run ID.
+      const expected = [...extra]
+        .sort((a, b) => b.updatedAt - a.updatedAt || a.runId.localeCompare(b.runId))
+        .map((item) => item.runId);
+      expect(seen).toEqual(expected);
+      // Traversing everything twice gives the same order.
+      const all = (await store.snapshots({ pageSize: 13 })).map((item) => item.record.runId);
+      expect(all).toHaveLength(1_030);
+      expect(new Set(all).size).toBe(1_030);
+      expect((await store.snapshots({ pageSize: 1_000 })).map((item) => item.record.runId)).toEqual(
+        all,
+      );
+      await expect(store.listRuns({ limit: 0 })).rejects.toThrow(/limit/);
+    });
   });
 });

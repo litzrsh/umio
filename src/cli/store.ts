@@ -10,6 +10,7 @@ import { FileCheckpointStore } from "../graph/checkpoint/file.js";
 import { PostgresCheckpointStore, type SqlClient } from "../graph/checkpoint/postgres.js";
 import type { CheckpointStore } from "../graph/checkpoint/store.js";
 import type { ApprovalDecision, WorkflowRun } from "../graph/types.js";
+import { sanitizeConnectionString, sanitizeText } from "../secrets.js";
 import { CliError } from "./explain.js";
 
 /** One run as the commands see it, from either store. */
@@ -29,13 +30,35 @@ export interface RunView {
 
 export type CliStore = FileCliStore | PostgresCliStore;
 
+export interface RunFilter {
+  readonly status?: WorkflowRun["status"];
+  /** Only runs with an approval waiting for a decision. */
+  readonly awaitingApproval?: boolean;
+}
+
+/** The file store's filter, applied in memory (it always reads every run). */
+function matches(record: WorkflowRun, filter: RunFilter): boolean {
+  if (filter.status !== undefined && record.status !== filter.status) return false;
+  if (filter.awaitingApproval) {
+    const active = ["running", "paused", "needs-recovery"].includes(record.status);
+    if (!active || !Object.values(record.nodes).some((node) => node.status === "waiting")) {
+      return false;
+    }
+  }
+  return true;
+}
+
 interface CliStoreBase {
   /** For messages: the directory, or the database with its credentials hidden. */
   readonly location: string;
   /** Runs `task` with a writable store (the file store is claimed for the duration). */
   withStore<T>(task: (store: CheckpointStore) => Promise<T>): Promise<T>;
   snapshot(runId: string): Promise<RunView | undefined>;
-  list(): Promise<RunView[]>;
+  /**
+   * Every run matching the filter, most recently updated first. Complete: the
+   * filter is applied before any paging (the Postgres store reads all pages).
+   */
+  list(filter?: RunFilter): Promise<RunView[]>;
   close(): Promise<void>;
 }
 
@@ -95,10 +118,10 @@ function fileStore(dir: string): FileCliStore {
       }
     },
     snapshot: (runId) => FileCheckpointStore.snapshot(dir, runId),
-    list: async () =>
-      (await FileCheckpointStore.snapshots(dir)).sort(
-        (a, b) => b.record.updatedAt - a.record.updatedAt,
-      ),
+    list: async (filter = {}) =>
+      (await FileCheckpointStore.snapshots(dir))
+        .filter((run) => matches(run.record, filter))
+        .sort((a, b) => b.record.updatedAt - a.record.updatedAt),
     close: async () => {},
   };
 }
@@ -123,10 +146,16 @@ async function postgresStore(
   };
   return {
     kind: "postgres",
-    location: `postgres ${redact(options.connectionString)}${options.schema ? ` (schema ${options.schema})` : ""}`,
+    location: `postgres ${sanitizeConnectionString(options.connectionString)}${options.schema ? ` (schema ${options.schema})` : ""}`,
     withStore: (task) => guard(() => task(store)),
     snapshot: (runId) => guard(() => store.snapshot(runId)),
-    list: () => guard(() => store.snapshots()),
+    list: (filter = {}) =>
+      guard(() =>
+        store.snapshots({
+          ...(filter.status !== undefined && { status: filter.status }),
+          ...(filter.awaitingApproval && { awaitingApproval: true }),
+        }),
+      ),
     migrate: () => guard(() => PostgresCheckpointStore.migrate(pool, names)),
     close: () => pool.end(),
   };
@@ -154,21 +183,13 @@ function explainPostgres(error: unknown): unknown {
     });
   }
   if (code === "ECONNREFUSED" || code === "ENOTFOUND" || code === "28P01" || code === "3D000") {
-    return new CliError(`Cannot use the PostgreSQL checkpoint store: ${(error as Error).message}`, {
-      hint: "Check graph.checkpoint.connectionString in the config (or the --store URL), and that the server is running.",
-      cause: error,
-    });
+    return new CliError(
+      `Cannot use the PostgreSQL checkpoint store: ${sanitizeText((error as Error).message)}`,
+      {
+        hint: "Check graph.checkpoint.connectionString in the config (or the --store URL), and that the server is running.",
+        cause: error,
+      },
+    );
   }
   return error;
-}
-
-/** A connection string without its password. */
-export function redact(connectionString: string): string {
-  try {
-    const url = new URL(connectionString);
-    if (url.password) url.password = "***";
-    return url.toString();
-  } catch {
-    return "(connection string)";
-  }
 }

@@ -97,6 +97,26 @@ describe("parseCommandLine", () => {
       error: "graph approve needs <run-id> <node-id>.",
     });
     expect(command("graph", "migrate").command).toEqual({ kind: "graph-migrate" });
+    expect(command("skills").command).toEqual({ kind: "skills-list" });
+    expect(command("skills", "list").command).toEqual({ kind: "skills-list" });
+    expect(command("skills", "show", "code-review").command).toEqual({
+      kind: "skills-show",
+      name: "code-review",
+    });
+    expect(parseCommandLine(["skills", "show"])).toMatchObject({ ok: false, topic: "skills" });
+    const withSkills = parseCommandLine(["ask", "--skill", "a", "--skill", "b", "hi"]);
+    expect(withSkills.ok && withSkills.options).toMatchObject({
+      skills: ["a", "b"],
+      noSkills: false,
+    });
+    expect(parseCommandLine(["ask", "--no-skills", "hi"])).toMatchObject({
+      ok: true,
+      options: { noSkills: true },
+    });
+    expect(parseCommandLine(["ask", "--skill", "a", "--no-skills", "hi"])).toMatchObject({
+      ok: false,
+      error: "Use either --skill or --no-skills, not both.",
+    });
     expect(command("graph", "list", "--needs-recovery").command).toEqual({
       kind: "graph-list",
       needsRecovery: true,

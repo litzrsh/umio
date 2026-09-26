@@ -22,6 +22,10 @@ export interface GlobalOptions {
   readonly heartbeatMs: number;
   readonly debug: boolean;
   readonly verbose: boolean;
+  /** `--skill` (repeatable): replaces the configured activation, within the configured include. */
+  readonly skills?: readonly string[];
+  /** `--no-skills`: no skill context or tools for this invocation. */
+  readonly noSkills: boolean;
 }
 
 export type RecoverChoice =
@@ -39,6 +43,8 @@ export type Command =
   | { readonly kind: "config" }
   | { readonly kind: "models" }
   | { readonly kind: "tools" }
+  | { readonly kind: "skills-list" }
+  | { readonly kind: "skills-show"; readonly name: string }
   | {
       readonly kind: "graph-run";
       readonly module: string;
@@ -99,6 +105,8 @@ const OPTIONS = {
   heartbeat: { type: "string" },
   debug: { type: "boolean" },
   verbose: { type: "boolean" },
+  skill: { type: "string", multiple: true },
+  "no-skills": { type: "boolean" },
   help: { type: "boolean", short: "h" },
   version: { type: "boolean", short: "v" },
   // Command-specific.
@@ -159,7 +167,12 @@ export function parseCommandLine(argv: readonly string[]): ParseResult {
     heartbeatMs: heartbeat ?? DEFAULT_HEARTBEAT_MS,
     debug: values.debug ?? false,
     verbose: values.verbose ?? false,
+    ...(values.skill !== undefined && { skills: values.skill }),
+    noSkills: values["no-skills"] ?? false,
   };
+  if (values.skill !== undefined && values["no-skills"]) {
+    return { ok: false, error: "Use either --skill or --no-skills, not both." };
+  }
   const ok = (command: Command): ParseResult => ({ ok: true, command, options });
 
   if (values.version) return ok({ kind: "version" });
@@ -204,6 +217,21 @@ export function parseCommandLine(argv: readonly string[]): ParseResult {
       return extra(0, name) ?? ok({ kind: name });
     case "graph":
       return parseGraph(rest, values, ok);
+    case "skills": {
+      const [sub, ...args] = rest;
+      if (sub === undefined || sub === "list") {
+        return args.length > 0
+          ? { ok: false, error: `Unexpected argument "${args[0]}".`, topic: "skills" }
+          : ok({ kind: "skills-list" });
+      }
+      if (sub === "show") {
+        if (args.length !== 1) {
+          return { ok: false, error: "skills show needs exactly one <name>.", topic: "skills" };
+        }
+        return ok({ kind: "skills-show", name: args[0] as string });
+      }
+      return { ok: false, error: `Unknown skills subcommand "${sub}".`, topic: "skills" };
+    }
     default:
       return {
         ok: false,

@@ -164,6 +164,42 @@ describe.skipIf(!POSTGRES_URL)("PostgresCheckpointStore on a server", () => {
     await expect(make().loadDecisions("run")).resolves.toEqual([recorded[0]?.decision]);
   });
 
+  it("lists every matching run in stable pages behind many newer runs (fix 2026-09-27 #3)", async () => {
+    const { tablePrefix, make } = await fresh();
+    const db = client(1);
+    // 450 paused runs waiting for approval (150 per timestamp), then 1 000 newer completed runs.
+    await db.query(
+      `INSERT INTO ${tablePrefix}runs (run_id, instance, record, schema_version, workflow_id, status,
+                                       revision, created_at, updated_at)
+       SELECT 'w-' || lpad(i::text, 4, '0'), 'i', json_build_object('schemaVersion', 2,
+                'runId', 'w-' || lpad(i::text, 4, '0'), 'workflowId', 'wf', 'definitionVersion', '1',
+                'definitionHash', 'h', 'status', 'paused', 'input', null,
+                'nodes', json_build_object('gate', json_build_object('nodeId', 'gate',
+                  'status', 'waiting', 'attempt', 0)),
+                'edges', '{}'::json, 'revision', 0, 'createdAt', 0, 'updatedAt', i / 150),
+              2, 'wf', 'paused', 0, 0, i / 150
+       FROM generate_series(0, 449) AS i
+       UNION ALL
+       SELECT 'd-' || i, 'i', json_build_object('schemaVersion', 1, 'runId', 'd-' || i,
+                'workflowId', 'wf', 'definitionVersion', '1', 'definitionHash', 'h',
+                'status', 'completed', 'input', null, 'nodes', '{}'::json, 'edges', '{}'::json,
+                'revision', 0, 'createdAt', 0, 'updatedAt', 100 + i),
+              1, 'wf', 'completed', 0, 0, 100 + i
+       FROM generate_series(1, 1000) AS i`,
+    );
+    const store = make();
+    const first = (await store.snapshots({ awaitingApproval: true, pageSize: 100 })).map(
+      (item) => item.record.runId,
+    );
+    expect(first).toHaveLength(450);
+    expect(new Set(first).size).toBe(450);
+    const again = (await store.snapshots({ awaitingApproval: true, pageSize: 37 })).map(
+      (item) => item.record.runId,
+    );
+    expect(again).toEqual(first);
+    expect(await store.snapshots({ status: "completed" })).toHaveLength(1_000);
+  });
+
   it("a cancel from another client reaches the owner through the flag, and cancel() finalizes an unowned run", async () => {
     const { make } = await fresh();
     await make().create(record(), "owner", 100);

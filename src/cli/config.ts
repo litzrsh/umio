@@ -8,6 +8,7 @@ import { createToolsets } from "../builtin/registry.js";
 import { DEFAULT_CONFIG_FILE, loadConfig, resolveProviderConfig } from "../config/load.js";
 import type { UmioConfig } from "../config/schema.js";
 import { effectiveProviderSettings } from "../llm/local.js";
+import { sanitizeConnectionString, sanitizeUrl } from "../secrets.js";
 import type { Toolset } from "../tools/toolset.js";
 import { formatDuration } from "./duration.js";
 import { CliError } from "./explain.js";
@@ -183,13 +184,19 @@ export function describeModel(summary: ModelSummary): string {
   return `${summary.alias} → ${summary.model} (${summary.provider}${type}${where}${timeout})`;
 }
 
-/** The config with literal secrets masked; `${VAR}` references are shown as written. */
+/**
+ * The config with secrets masked, for display: literal values of secret-named
+ * keys, connection strings (password and credential parameters, or the whole
+ * string if it cannot be parsed), and credentials inside any URL value.
+ * `${VAR}` references (unresolved provider fields) are shown as written.
+ */
 export function maskedConfig(config: UmioConfig): unknown {
   const mask = (value: unknown, key = ""): unknown => {
     if (typeof value === "string") {
-      return /key|token|secret|password/i.test(key) && !/^\$\{[^}]+\}$/.test(value)
-        ? "••••"
-        : value;
+      if (/^\$\{[^}]+\}$/.test(value)) return value;
+      if (/key|token|secret|password/i.test(key)) return "••••";
+      if (/connection(string|uri|url)|^dsn$/i.test(key)) return sanitizeConnectionString(value);
+      return sanitizeUrl(value) ?? value;
     }
     if (Array.isArray(value)) return value.map((item) => mask(item));
     if (value && typeof value === "object") {

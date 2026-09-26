@@ -22,6 +22,9 @@ export {
   type PostgresCheckpointStoreOptions,
   type PostgresRunSnapshot,
   postgresSchemaSql,
+  type RunListCursor,
+  type RunListQuery,
+  type RunPage,
   type SqlClient,
 } from "./checkpoint/postgres.js";
 export {

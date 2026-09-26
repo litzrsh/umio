@@ -21,6 +21,7 @@ export {
   type OpenAIProviderConfig,
   type ProviderConfig,
   type ResponseCacheConfig,
+  type SkillsConfig,
   type ToolsetSpec,
   type UmioConfig,
   type UmioConfigInput,
@@ -63,4 +64,5 @@ export type {
   UserMessage,
 } from "./llm/types.js";
 export * from "./middleware/index.js";
+export * from "./skills/index.js";
 export * from "./tools/index.js";

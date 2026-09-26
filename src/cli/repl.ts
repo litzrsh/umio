@@ -32,6 +32,7 @@ import { formatCount, summarizeInput, truncate, turnFooter } from "./format.js";
 import { TOPICS } from "./help.js";
 import { completeLine, keyAction, parseLine } from "./keys.js";
 import { ChatSession, OperationGate, type OperationKind } from "./session.js";
+import { cliSkills } from "./skills.js";
 import { TerminalChatView } from "./views.js";
 
 export async function startRepl(context: Context): Promise<number> {
@@ -43,6 +44,8 @@ export async function startRepl(context: Context): Promise<number> {
   const toolsets = selectToolsets(config, options.tools);
   const tools: Tool[] = Object.values(toolsets).flatMap((set) => [...set]);
   const llm = modelClient(context, config);
+  // The catalog is frozen for the session; each turn prepares it afresh.
+  const skills = await cliSkills(config, options);
   const session = new ChatSession(requireModel(config, options.model), now(), shortId());
   const gate = new OperationGate();
   const history: string[] = [];
@@ -54,7 +57,7 @@ export async function startRepl(context: Context): Promise<number> {
     summarizeModels(config, io.env).find((model) => model.alias === session.model);
 
   terminal.line(
-    `${style.bold("umio")} ${style.dim(`· model ${session.model} (${describeCurrentModel()?.model ?? "?"}${describeCurrentModel()?.local ? ", local" : ""}) · tools: ${Object.keys(toolsets).join(", ") || "none"} · /help · Ctrl+D to exit`)}`,
+    `${style.bold("umio")} ${style.dim(`· model ${session.model} (${describeCurrentModel()?.model ?? "?"}${describeCurrentModel()?.local ? ", local" : ""}) · tools: ${Object.keys(toolsets).join(", ") || "none"}${skills?.selection.activate?.length ? ` · skills: ${skills.selection.activate.join(", ")}` : ""} · /help · Ctrl+D to exit`)}`,
   );
 
   /** Reads one line; null on Ctrl+D (or when stdin ends). */
@@ -188,6 +191,7 @@ export async function startRepl(context: Context): Promise<number> {
       runChatTurn(session, text, {
         llm,
         tools,
+        ...(skills && { skills }),
         signal,
         autoApprove: options.yes,
         approve: (call, tool) => approve(call, tool, activity),

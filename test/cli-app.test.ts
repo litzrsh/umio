@@ -2,9 +2,9 @@
  * The CLI end to end through `runCli` with fake streams, a scripted model and
  * real temp directories (config, workflow modules, checkpoint store).
  */
-import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { Readable } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
 import { type CliIO, runCli } from "../src/cli/app.js";
@@ -650,5 +650,339 @@ describe("umio graph", () => {
     const { io } = fakeIO(dir);
     expect(await runCli(["graph", "migrate"], io)).toBe(0);
     expect(io.stdout.text).toMatch(/The file store needs no setup/);
+  });
+
+  it("never prints PostgreSQL passwords (fix 2026-09-27 #2), yet connects with the original string", async () => {
+    const secret = "REVIEW_FAKE_SECRET";
+    const dir = await project(
+      baseConfig({
+        graph: { checkpoint: { type: "postgres", connectionString: "${DATABASE_URL}" } },
+      }),
+    );
+    const env = { DATABASE_URL: `postgres://review:${secret}@localhost/review?password=${secret}` };
+    const connected: string[] = [];
+    const db = await pglite();
+    const loadPg = async (): Promise<PgModule> => ({
+      Pool: class {
+        constructor(options: { connectionString: string }) {
+          connected.push(options.connectionString);
+        }
+        query = db.query;
+        async end() {}
+      },
+    });
+    try {
+      const outputs: string[] = [];
+      for (const args of [
+        ["config", "--json"],
+        ["config"],
+        ["graph", "migrate"],
+        ["graph", "migrate", "--json"],
+        ["graph", "list"],
+        ["graph", "approvals"],
+        ["graph", "status", "missing"],
+        ["graph", "list", "--store", `postgres://review@localhost/review?Password=${secret}`],
+      ]) {
+        const { io } = fakeIO(dir, { env });
+        await runCli([...args, "--no-color"], io, { loadPg });
+        outputs.push(io.stdout.text + io.stderr.text);
+      }
+      for (const output of outputs) expect(output).not.toContain(secret);
+      expect(JSON.parse(outputs[0] as string).config.graph.checkpoint.connectionString).toBe(
+        "postgres://review:***@localhost/review?password=***",
+      );
+      expect(outputs[1]).toMatch(/runs: postgres postgres:\/\/review:\*\*\*@localhost\/review/);
+      expect(outputs[2]).toMatch(
+        /Checkpoint tables are ready in postgres postgres:\/\/review:\*\*\*@/,
+      );
+      // The driver still received the real credentials.
+      expect(connected).toContain(env.DATABASE_URL);
+      expect(connected).toContain(`postgres://review@localhost/review?Password=${secret}`);
+    } finally {
+      await db.close();
+    }
+  });
+
+  it("keeps masking provider keys and other secret-named values", async () => {
+    const dir = await project(
+      baseConfig({
+        providers: {
+          ollama: { type: "ollama", baseURL: "http://127.0.0.1:9/v1" },
+          anthropic: { type: "anthropic", apiKey: "sk-literal-secret" },
+          proxy: { type: "openai-compatible", baseURL: "https://u:proxy-secret@proxy.example/v1" },
+        },
+      }),
+    );
+    for (const args of [["config", "--json"], ["config"]]) {
+      const { io } = fakeIO(dir);
+      await runCli([...args, "--no-color"], io);
+      expect(io.stdout.text).not.toMatch(/sk-literal-secret|proxy-secret/);
+    }
+  });
+
+  it("lists old approvals and recovery runs behind 1 000 newer runs on PostgreSQL (fix 2026-09-27 #3)", async () => {
+    const dir = await project();
+    const db = await pglite();
+    const loadPg = async (): Promise<PgModule> => ({
+      Pool: class {
+        query = db.query;
+        async end() {}
+      },
+    });
+    const store = ["--store", "postgres://umio@localhost/umio"];
+    const cli = async (args: string[]) => {
+      const { io } = fakeIO(dir);
+      const code = await runCli([...args, ...store, "--no-color"], io, { loadPg });
+      return { code, out: io.stdout.text };
+    };
+    try {
+      expect((await cli(["graph", "migrate"])).code).toBe(0);
+      const base = {
+        schemaVersion: 2,
+        workflowId: "wf",
+        definitionVersion: "1",
+        definitionHash: "h",
+        input: null,
+        edges: {},
+        revision: 0,
+        createdAt: 1,
+      };
+      const gate = (runId: string) => ({
+        gate: {
+          nodeId: "gate",
+          status: "waiting",
+          attempt: 0,
+          approval: {
+            requestId: `q-${runId}`,
+            requestedAt: 1,
+            title: "Go?",
+            context: [],
+            onReject: "fail",
+          },
+        },
+      });
+      const insert = (record: Record<string, unknown>) =>
+        db.query(
+          `INSERT INTO umio_runs (run_id, instance, record, schema_version, workflow_id, status, revision,
+                                  created_at, updated_at)
+           VALUES ($1, 'i', $2::json, 2, 'wf', $3, 0, 1, $4)`,
+          [record.runId, JSON.stringify(record), record.status, record.updatedAt],
+        );
+      await insert({
+        ...base,
+        runId: "old-paused",
+        status: "paused",
+        updatedAt: 2,
+        nodes: gate("old-paused"),
+      });
+      await insert({
+        ...base,
+        runId: "old-running",
+        status: "running",
+        updatedAt: 3,
+        nodes: gate("old-running"),
+      });
+      await insert({
+        ...base,
+        runId: "old-recovery",
+        status: "needs-recovery",
+        updatedAt: 4,
+        nodes: {
+          ...gate("old-recovery"),
+          work: {
+            nodeId: "work",
+            status: "uncertain",
+            attempt: 1,
+            uncertainReason: "process-lost",
+          },
+        },
+      });
+      await db.query(
+        `INSERT INTO umio_runs (run_id, instance, record, schema_version, workflow_id, status, revision,
+                                created_at, updated_at)
+         SELECT 'done-' || i, 'i', json_build_object('schemaVersion', 1, 'runId', 'done-' || i,
+                  'workflowId', 'wf', 'definitionVersion', '1', 'definitionHash', 'h',
+                  'status', 'completed', 'input', null, 'nodes', '{}'::json, 'edges', '{}'::json,
+                  'revision', 0, 'createdAt', 0, 'updatedAt', 1000 + i),
+                1, 'wf', 'completed', 0, 0, 1000 + i
+         FROM generate_series(1, 1000) AS i`,
+      );
+
+      const approvals = await cli(["graph", "approvals", "--json"]);
+      expect(approvals.code).toBe(0);
+      expect(JSON.parse(approvals.out).map((item: { runId: string }) => item.runId)).toEqual([
+        "old-recovery",
+        "old-running",
+        "old-paused",
+      ]);
+      const recovery = await cli(["graph", "list", "--needs-recovery", "--json"]);
+      expect(JSON.parse(recovery.out).map((item: { runId: string }) => item.runId)).toEqual([
+        "old-recovery",
+      ]);
+      const all = await cli(["graph", "list", "--json"]);
+      expect(JSON.parse(all.out)).toHaveLength(1_003);
+      const direct = await cli(["graph", "approvals", "old-paused", "--json"]);
+      expect(JSON.parse(direct.out)).toMatchObject([{ runId: "old-paused", nodeId: "gate" }]);
+    } finally {
+      await db.close();
+    }
+  }, 60_000);
+
+  it("filters the file store the same way", async () => {
+    const dir = await project();
+    const path = await module(dir, release);
+    await runCli(["graph", "run", path, "--run-id", "p1"], fakeIO(dir).io);
+    await runCli(["graph", "run", path, "--run-id", "p2"], fakeIO(dir).io);
+    await runCli(["graph", "cancel", "p2"], fakeIO(dir).io);
+    const approvals = fakeIO(dir);
+    await runCli(["graph", "approvals", "--json"], approvals.io);
+    expect(
+      JSON.parse(approvals.io.stdout.text).map((item: { runId: string }) => item.runId),
+    ).toEqual(["p1"]);
+    const recovery = fakeIO(dir);
+    await runCli(["graph", "list", "--needs-recovery", "--json"], recovery.io);
+    expect(JSON.parse(recovery.io.stdout.text)).toEqual([]);
+  });
+});
+
+describe("skills", () => {
+  async function skillProject(skills: object = {}) {
+    const dir = await project(
+      baseConfig({
+        skills: { roots: ["skills"], include: ["code-review", "test-design"], ...skills },
+      }),
+    );
+    const put = async (path: string, content: string) => {
+      await mkdir(dirname(join(dir, path)), { recursive: true });
+      await writeFile(join(dir, path), content);
+    };
+    await put(
+      "skills/code-review/SKILL.md",
+      "---\nname: code-review\ndescription: Review changes for missing tests.\n---\n\nREVIEW-BODY\n",
+    );
+    await put("skills/code-review/references/checklist.md", "CHECKLIST");
+    await put(
+      "skills/test-design/SKILL.md",
+      "---\nname: test-design\ndescription: Design tests.\n---\n\nTEST-BODY\n",
+    );
+    await put(
+      "skills/secret-ops/SKILL.md",
+      "---\nname: secret-ops\ndescription: Not permitted.\n---\n\nSECRET-BODY\n",
+    );
+    return dir;
+  }
+  const systemOf = (request: GenerateRequest | undefined) =>
+    typeof request?.system === "string"
+      ? request.system
+      : (request?.system ?? []).map((part) => part.text).join("\n");
+
+  it("lists permitted skills with activation, and shows one; unpermitted skills stay hidden", async () => {
+    const dir = await skillProject({ activate: ["code-review"] });
+    const list = fakeIO(dir);
+    expect(await runCli(["skills", "--no-color"], list.io)).toBe(0);
+    expect(list.io.stdout.text).toMatch(/Skills · model selection off · 2 permitted of 3 found/);
+    expect(list.io.stdout.text).toMatch(
+      /code-review {2}active {2}Review changes for missing tests\. sha256:[0-9a-f]{12}/,
+    );
+    expect(list.io.stdout.text).toMatch(/test-design {10}Design tests\./);
+    expect(list.io.stdout.text).not.toMatch(/secret-ops/);
+    const json = fakeIO(dir);
+    await runCli(["skills", "list", "--json"], json.io);
+    expect(JSON.parse(json.io.stdout.text)).toMatchObject({
+      configured: true,
+      include: ["code-review", "test-design"],
+      activate: ["code-review"],
+      skills: [
+        { name: "code-review", active: true, digest: expect.stringMatching(/^[0-9a-f]{64}$/) },
+        { name: "test-design", active: false },
+      ],
+      diagnostics: [],
+    });
+    const show = fakeIO(dir);
+    expect(await runCli(["skills", "show", "code-review", "--no-color"], show.io)).toBe(0);
+    expect(show.io.stdout.text).toMatch(
+      /^code-review sha256:[0-9a-f]{64}\nReview changes for missing tests\.\n\nREVIEW-BODY\n$/,
+    );
+    const hidden = fakeIO(dir);
+    expect(await runCli(["skills", "show", "secret-ops"], hidden.io)).toBe(1);
+    expect(hidden.io.stderr.text).toMatch(/not permitted by skills\.include/);
+    expect(hidden.io.stdout.text).not.toMatch(/SECRET-BODY/);
+  });
+
+  it("reports invalid packages and missing permitted skills with exit 1; no section is not an error", async () => {
+    const dir = await skillProject({ include: ["code-review", "absent"] });
+    await writeFile(join(dir, "skills/test-design/SKILL.md"), "no frontmatter");
+    const { io } = fakeIO(dir);
+    expect(await runCli(["skills", "--no-color"], io)).toBe(1);
+    expect(io.stdout.text).toMatch(/absent +not found in skills/);
+    expect(io.stdout.text).toMatch(/✗ .*test-design\/SKILL\.md: must start with YAML frontmatter/);
+    const plain = fakeIO(await project());
+    expect(await runCli(["skills"], plain.io)).toBe(0);
+    expect(plain.io.stdout.text).toMatch(/No skills configured\./);
+  });
+
+  it("ask applies the configured activation; --skill replaces it; --no-skills removes skills", async () => {
+    const dir = await skillProject({ activate: ["code-review"] });
+    const run = async (args: string[]) => {
+      const { model, requests } = scripted([reply("ok")]);
+      const { io } = fakeIO(dir);
+      const code = await runCli(["ask", ...args, "hi"], io, { createModel: () => model });
+      return { code, request: requests[0], io };
+    };
+    const configured = await run([]);
+    expect(configured.code).toBe(0);
+    expect(systemOf(configured.request)).toMatch(/REVIEW-BODY/);
+    expect(configured.request?.tools?.map((tool) => tool.name)).toContain("skills_read");
+    const replaced = await run(["--skill", "test-design"]);
+    expect(systemOf(replaced.request)).toMatch(/TEST-BODY/);
+    expect(systemOf(replaced.request)).not.toMatch(/REVIEW-BODY/);
+    const both = await run(["--skill", "test-design", "--skill", "code-review"]);
+    expect(systemOf(both.request)).toMatch(/REVIEW-BODY[\s\S]*TEST-BODY/);
+    const off = await run(["--no-skills"]);
+    expect(systemOf(off.request)).not.toMatch(/Skills|BODY/);
+    expect(off.request?.tools?.map((tool) => tool.name)).not.toContain("skills_read");
+  });
+
+  it("a flag never expands include, and --skill with --no-skills is a usage error", async () => {
+    const dir = await skillProject();
+    const outside = fakeIO(dir);
+    expect(await runCli(["ask", "--skill", "secret-ops", "hi"], outside.io)).toBe(2);
+    expect(outside.io.stderr.text).toMatch(
+      /--skill secret-ops: not permitted by skills\.include in the config\.\nhint: Permitted: code-review, test-design\./,
+    );
+    const both = fakeIO(dir);
+    expect(await runCli(["ask", "--skill", "code-review", "--no-skills", "hi"], both.io)).toBe(2);
+    expect(both.io.stderr.text).toMatch(/Use either --skill or --no-skills, not both\./);
+    const unconfigured = fakeIO(await project());
+    expect(await runCli(["ask", "--skill", "code-review", "hi"], unconfigured.io)).toBe(2);
+    expect(unconfigured.io.stderr.text).toMatch(/--skill needs a skills section/);
+  });
+
+  it("with model selection, the model loads and reads a skill without a confirmation (read-only tools)", async () => {
+    const dir = await skillProject({ allowModelSelection: true });
+    const { model, requests } = scripted([
+      reply("", [
+        { type: "tool-call", id: "l", name: "skills_load", input: { name: "code-review" } },
+      ]),
+      reply("", [
+        {
+          type: "tool-call",
+          id: "r",
+          name: "skills_read",
+          input: { name: "code-review", path: "references/checklist.md" },
+        },
+      ]),
+      reply("Reviewed."),
+    ]);
+    const { io } = fakeIO(dir);
+    // Not interactive and no --yes: tools that may change things would be declined.
+    expect(await runCli(["ask", "--no-color", "review"], io, { createModel: () => model })).toBe(0);
+    expect(io.stdout.text).toBe("Reviewed.\n");
+    expect(io.stderr.text).toMatch(/✓ skills_load[\s\S]*✓ skills_read/);
+    expect(systemOf(requests[0])).toMatch(/- code-review: Review changes for missing tests\./);
+    expect(systemOf(requests[0])).not.toMatch(/REVIEW-BODY|secret-ops/);
+    const last = JSON.stringify(requests[2]?.messages);
+    expect(last).toMatch(/REVIEW-BODY/);
+    expect(last).toMatch(/CHECKLIST/);
   });
 });

@@ -11,6 +11,8 @@ import type { UmioConfig } from "../config/schema.js";
 import type { WorkflowRun } from "../graph/types.js";
 import { LLM } from "../llm/client.js";
 import type { ModelClient } from "../llm/types.js";
+import { sanitizeConnectionString, sanitizeUrl } from "../secrets.js";
+import { skillsFromConfig } from "../skills/config.js";
 import type { Tool } from "../tools/tool.js";
 import { Activity } from "./activity.js";
 import { type Command, type GlobalOptions, parseCommandLine } from "./args.js";
@@ -45,6 +47,7 @@ import {
 } from "./graph.js";
 import { helpFor } from "./help.js";
 import { ChatSession } from "./session.js";
+import { cliSkills } from "./skills.js";
 import { type CliStore, openCliStore, type PgModule } from "./store.js";
 import { createStyle, detectColor } from "./style.js";
 import { type OutputStream, Terminal, type Timers } from "./terminal.js";
@@ -200,6 +203,9 @@ async function dispatch(command: Command, context: Context): Promise<number> {
       for (const line of toolLines(toolsets, context)) terminal.line(line);
       return EXIT.ok;
     }
+    case "skills-list":
+    case "skills-show":
+      return skillsCommand(command, context);
     case "ask":
       return ask(command.prompt, context);
     case "chat": {
@@ -292,9 +298,7 @@ async function storeCommand(
       return statusCode(snapshot.record.status);
     }
     case "graph-list": {
-      const runs = (await backend.list()).filter(
-        (run) => !command.needsRecovery || run.record.status === "needs-recovery",
-      );
+      const runs = await backend.list(command.needsRecovery ? { status: "needs-recovery" } : {});
       if (options.json)
         return json(
           context,
@@ -623,6 +627,83 @@ function cancelOnSignals(
   };
 }
 
+/** `umio skills list|show`: what the config permits, validated. */
+async function skillsCommand(
+  command: Extract<Command, { kind: "skills-list" | "skills-show" }>,
+  context: Context,
+): Promise<number> {
+  const { io, options, terminal } = context;
+  const { style } = terminal;
+  const { config } = await loadCliConfig(io.cwd, io.env, options.config);
+  const section = config.skills;
+  if (!section) {
+    if (options.json) return json(context, { configured: false, skills: [] });
+    terminal.line("No skills configured.");
+    terminal.line(
+      style.dim('  Add "skills": { "roots": ["./skills"], "include": ["<name>"] } to the config.'),
+    );
+    return command.kind === "skills-list" ? EXIT.ok : EXIT.error;
+  }
+  const binding = await skillsFromConfig(config);
+  if (!binding) return EXIT.error;
+  const { catalog } = binding;
+  const activate = new Set(section.activate ?? []);
+  const permitted = catalog.list().filter((skill) => section.include.includes(skill.name));
+
+  if (command.kind === "skills-show") {
+    if (!section.include.includes(command.name)) {
+      throw new CliError(`Skill "${command.name}" is not permitted by skills.include.`, {
+        hint: `Permitted: ${section.include.join(", ") || "(none)"}.`,
+      });
+    }
+    const skill = await catalog.load(command.name);
+    if (options.json) return json(context, { ...skill, active: activate.has(skill.name) });
+    terminal.line(`${style.bold(skill.name)} ${style.dim(`sha256:${skill.digest}`)}`);
+    terminal.line(skill.description);
+    terminal.line();
+    terminal.line(skill.body);
+    return EXIT.ok;
+  }
+
+  const missing = section.include.filter(
+    (name) => !catalog.list().some((skill) => skill.name === name),
+  );
+  if (options.json) {
+    json(context, {
+      configured: true,
+      roots: section.roots,
+      include: section.include,
+      activate: section.activate ?? [],
+      allowModelSelection: section.allowModelSelection ?? false,
+      skills: permitted.map((skill) => ({ ...skill, active: activate.has(skill.name) })),
+      missing,
+      diagnostics: catalog.diagnostics,
+    });
+  } else {
+    terminal.line(
+      `${style.bold("Skills")} ${style.dim(`· model selection ${section.allowModelSelection ? "on" : "off"} · ${permitted.length} permitted of ${catalog.list().length} found`)}`,
+    );
+    const width = Math.max(4, ...permitted.map((skill) => skill.name.length));
+    for (const skill of permitted) {
+      const mark = activate.has(skill.name) ? style.green("active") : style.dim("      ");
+      terminal.line(
+        `  ${skill.name.padEnd(width)}  ${mark}  ${oneLine(skill.description)} ${style.dim(`sha256:${skill.digest.slice(0, 12)}`)}`,
+      );
+    }
+    for (const name of missing) {
+      terminal.line(style.red(`  ${name.padEnd(width)}  not found in ${section.roots.join(", ")}`));
+    }
+    for (const item of catalog.diagnostics) {
+      terminal.line(
+        style.red(
+          `${style.symbols.error} ${item.path}${item.field ? ` (${item.field})` : ""}: ${item.message}`,
+        ),
+      );
+    }
+  }
+  return catalog.diagnostics.length > 0 || missing.length > 0 ? EXIT.error : EXIT.ok;
+}
+
 async function ask(prompt: string | undefined, context: Context): Promise<number> {
   const { io, options, terminal } = context;
   let text = prompt;
@@ -643,6 +724,7 @@ async function ask(prompt: string | undefined, context: Context): Promise<number
     ...set,
   ]);
   const llm = modelClient(context, located.config);
+  const skills = await cliSkills(located.config, options);
   const now = () => terminal.timers.now();
   const session = new ChatSession(model, now(), "ask");
   const activity = new Activity(now());
@@ -660,6 +742,7 @@ async function ask(prompt: string | undefined, context: Context): Promise<number
     outcome = await runChatTurn(session, text, {
       llm,
       tools,
+      ...(skills && { skills }),
       signal: controller.signal,
       autoApprove: options.yes,
       view: {
@@ -793,7 +876,7 @@ export function configLines({ config, path }: LocatedConfig, context: Context): 
   lines.push(`  ${style.bold("Providers")}`);
   for (const [name, provider] of Object.entries(config.providers)) {
     lines.push(
-      `    ${name}: ${provider.type}${"baseURL" in provider && provider.baseURL ? ` · ${provider.baseURL}` : ""}`,
+      `    ${name}: ${provider.type}${"baseURL" in provider && provider.baseURL ? ` · ${sanitizeUrl(provider.baseURL) ?? provider.baseURL}` : ""}`,
     );
   }
   lines.push(`  ${style.bold("Tools")} ${Object.keys(config.tools ?? {}).join(", ") || "(none)"}`);
@@ -804,6 +887,14 @@ export function configLines({ config, path }: LocatedConfig, context: Context): 
         ? "none"
         : `${Math.round((graph.nodeTimeoutMs ?? 10_800_000) / 60_000)} min`
     } per attempt (a whole agent run: all its model and tool calls)`,
+  );
+  const checkpoint = graph.checkpoint;
+  lines.push(
+    `    runs: ${
+      checkpoint?.type === "postgres"
+        ? `postgres ${sanitizeConnectionString(checkpoint.connectionString)}${checkpoint.schema ? ` (schema ${checkpoint.schema})` : ""}`
+        : `files in ${checkpoint?.dir ?? ".umio/runs"} (next to the config)`
+    }`,
   );
   return lines;
 }

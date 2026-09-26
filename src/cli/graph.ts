@@ -454,7 +454,9 @@ export async function listApprovals(
   backend: CliStore,
   runId: string | undefined,
 ): Promise<PendingApproval[]> {
-  const runs = runId ? [await runSnapshot(backend, runId)] : await backend.list();
+  const runs = runId
+    ? [await runSnapshot(backend, runId)]
+    : await backend.list({ awaitingApproval: true });
   return runs.flatMap((run) => pendingApprovalsOf(run.record, run.decisions));
 }
 

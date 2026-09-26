@@ -25,6 +25,7 @@
 - **Per-model harnesses.** A runtime profile per model (system preamble, middleware, tool-loop limits), declared in JSON.
 - **Agents and workflows.** `Agent`s with a role and their own tools, chained in a sequential `Workflow` with state shared through a `KVStore`.
 - **Architecture Decision Records** applied across a workflow. Every agent follows the accepted ADRs and can propose new ones for human review.
+- **Skills.** Reusable, file-based instruction packages (`SKILL.md` plus reference files) that an agent applies for a task: activated explicitly or loaded by the model from a permitted list, with bounded, read-only file access. A skill never grants tools or permissions.
 
 - **Built-in tools** for files, the web, command-line programs, SQL databases and utilities, each with safe defaults and configurable per project in JSON.
 
@@ -100,6 +101,17 @@ git diff | umio ask --tools none --json | jq -r .text
 
 `umio config`, `umio models` and `umio tools` show what is configured (`--json` for machines). Literal secrets are masked.
 
+Skills (see [Skills](#skills)) apply to `ask` and chat:
+
+```bash
+umio skills                             # validate the configured roots; list permitted skills
+umio skills show code-review            # its instructions and SHA-256 digest
+git diff | umio ask --skill code-review "Review this change"   # repeat --skill for more
+umio ask --no-skills "…"                # no skill instructions or tools this time
+```
+
+`--skill` replaces the configured `activate` list but can only name skills in `include`; `--skill` with `--no-skills` is a usage error. The skill tools are read-only, so they never ask for confirmation, and `--tools` still controls ordinary tools. In chat the catalog is loaded once per session and prepared again every turn.
+
 ### Long-running local models
 
 A local model can spend two or three hours on one request before it produces any text, and umio treats that as normal:
@@ -159,7 +171,7 @@ Exit codes for `run`, `resume` and `status`: 0 completed (or still running), 1 f
   }
   ```
 
-  `status` shows the database with its password hidden. A missing table is reported with the `migrate` hint.
+  Output never shows database credentials: `status`, `list`, `migrate` and `umio config` mask the URL's password and every credential query parameter (`password`, `sslpassword`, …), and hide a connection string they cannot parse; the driver still receives the original. A missing table is reported with the `migrate` hint. `list` and `approvals` read every matching run, however many there are.
 - **Approvals:** a run whose only remaining work waits for a person is `paused` (exit code 4), and no process owns it. `run`, `status` and `approvals` show each waiting request: its title and description, when it was asked, the run input and the outputs it concerns, and the exact `approve`/`reject` commands. A decision is recorded, never applied, by the command ("Approval recorded … not yet applied"): the process driving the run applies it within ~2 s, and a paused run applies it on `umio graph resume`. The first decision per request wins; a later, different one exits 1 with the decision that stands. `--by` defaults to your user name. These approvals are unrelated to chat's `y`/`n` confirmation before a tool runs.
 - **Cancelling from another terminal:** `umio graph cancel <run-id>` writes a small cancel-request file next to the run (atomically). It never writes the run's checkpoint or lease. The process driving the run checks for requests every ~2 s on its own timer, so it notices even during a silent multi-hour model call. It then cancels through its executor's normal, fenced path: running nodes are aborted and given their grace period, and the run is recorded `cancelled`.
   - **The reply distinguishes recorded from confirmed.** Without `--wait`, the command returns as soon as the request is stored: "Cancel request recorded — not yet confirmed". With `--wait` (up to `--timeout`, default 30 s), it watches the run until it ends: "Confirmed: run … is cancelled", or it reports that the run finished some other way first (exit 1), or that it is not confirmed yet (exit 1, and the request stays recorded).
@@ -543,6 +555,78 @@ Files are read as `NNNN-*.md`. The status comes from a `## Status` section or a 
 
 ---
 
+### Skills
+
+A skill is a directory with a `SKILL.md` and optional text files. The design, and what is deferred, is in `docs/design/umio-skills-design.md`.
+
+```text
+skills/
+  code-review/
+    SKILL.md
+    references/checklist.md
+```
+
+```markdown
+---
+name: code-review
+description: Review code changes for correctness and missing regression tests.
+---
+
+Inspect the changed behavior and its callers before proposing a fix.
+Read references/checklist.md when checking test coverage.
+```
+
+- **Format.** YAML frontmatter with exactly `name` (lowercase words joined by hyphens, at most 64 characters, equal to the directory name) and `description` (at most 1,024 characters), then a nonempty Markdown body. Duplicate keys, other fields, custom tags and aliases are rejected.
+- **Discovery.** `loadSkillCatalog({ roots, baseDir })` scans only the given roots, one level deep, in a deterministic order. Relative roots resolve against `baseDir`; nothing is loaded from your home directory or parent directories. Invalid packages, and names that appear in two roots, become `catalog.diagnostics` (file, field, message); `list()` shows the valid ones, and `prepare()` refuses to run until there are none.
+- **Selection.** `catalog.prepare({ include, activate?, allowModelSelection? })` makes the context and tools for **one** agent run.
+  - `include` is the permitted subset; an empty list permits nothing.
+  - `activate` puts those skills' instructions into the system prompt before the first model call.
+  - With `allowModelSelection`, the other permitted skills are listed by name and description, and the model may load one with `skills_load({ name })`. The body arrives as a tool result; the system prompt and toolset never change mid-run.
+  - Unknown names, and activation outside `include`, fail before any model call.
+- **Resources.** `skills_read({ name, path })` returns a UTF-8 text file of an **active** skill, relative to its directory. Absolute paths, `..`, symbolic links, directories and binary files are refused, as is a file that changed since it was first read in the run. Scripts are only text to the model: running one needs a command tool you configured, with its usual allowlist and confirmation.
+- **Limits** (bytes; they bound I/O and prompt growth, not tokens): 100 catalog entries, 64 KiB per `SKILL.md`, 128 KiB per file, 256 KiB of prompt per preparation, 1 MiB returned per run, repeats included. Nothing is truncated: an oversized preparation rejects with `SkillLimitError`, and an oversized read is an error result the model can react to.
+- **Prompt order.** Your context (ADRs), then the skills section, then the agent's role and standing instructions. The skills section tells the model that skills cannot grant tools or permissions; the tools it actually has are what enforces that.
+- **Identity.** Each skill has the SHA-256 `digest` of its `SKILL.md`. A document that changes after the catalog was loaded is refused (`SkillChangedError`); load a new catalog to pick it up. `prepared.usage()` (immutable) lists the documents and files used, with digests; `skillManifest(usage)` turns that into JSON, and `catalog.verify(manifest)` checks that the content is unchanged.
+
+```typescript
+import { Agent, loadSkillCatalog, withSkills } from "umio";
+
+const catalog = await loadSkillCatalog({ roots: ["./skills"], baseDir: process.cwd() });
+const reviewer = new Agent({ name: "Reviewer", role: "Reviews changes." });
+
+// One preparation per run: activation, read budget and usage are never shared.
+const { options, prepared } = await withSkills(
+  reviewer,
+  { llm, context: sharedContext, hooks, signal },
+  { catalog, selection: { include: ["code-review"], activate: ["code-review"] } },
+);
+const result = await reviewer.run(task, options);
+prepared?.usage();   // [{ name: "code-review", documentDigest, resources: [{ path, digest }] }]
+```
+
+`withSkills` adds the skill context after your `context` and the tools after your `extraTools`, and rejects an agent tool named `skills_load` or `skills_read`. Without a binding it returns the options unchanged. `catalog.prepare()` gives you the same `context` and `tools` if you compose them yourself.
+
+**In workflows and graph nodes**
+- `new Workflow({ …, skills: { catalog, selection } })` applies a binding to every step; `step(agent, { skills })` replaces it for one step, and `skills: false` removes it. Selections are never merged. Each step gets a fresh preparation, and `result.steps[i].skills` holds its manifest.
+- `agentNode(agent, { …, skills: { catalog, selection } })` binds skills to one graph node, prepared per attempt. Skill events arrive as `custom` node events named `"skill"`, and the node's output gains `skills` (the manifest).
+- A delegated agent (`agent.asTool`) gets no skills from its parent.
+- Durable runs do not check skill content on resume yet. Pin your skill packages and bump the graph `version` whenever they change; the manifest in a node's output records what it used.
+- `binding.onEvent` (or `prepare(…, { onEvent })`) reports preparations, loads and reads with names, digests, paths, sizes and outcomes, never document bodies. A throwing callback changes nothing.
+
+**Configuration**
+
+```json
+"skills": {
+  "roots": ["./skills"],
+  "include": ["code-review", "test-design"],
+  "activate": ["code-review"],
+  "allowModelSelection": false,
+  "limits": { "maxReadBytes": 524288 }
+}
+```
+
+`include` is required (it may be empty). `activate` must be a subset of it. Roots resolve against the config file's directory. `skillsFromConfig(config, { activate? })` returns the binding (or `undefined` without a `skills` section), which is what the CLI uses. See `examples/skills.ts` and `examples/skills/` (`npm run example:skills -- local`).
+
 ### Graph workflows
 
 `WorkflowExecutor` runs a directed acyclic graph of nodes: branches, parallel paths and joins, with retries, timeouts and cancellation. Every change to a run is checkpointed to a `CheckpointStore`, and an interrupted run can be resumed by another process. The design and its invariants are in `docs/work/umio-graph-workflow-plan.md`.
@@ -701,7 +785,7 @@ run = await executor.resume(definition, "release-42");                        //
 - `PostgresCheckpointStore` lets executors in several processes or on several machines share runs. It takes any client with `query(text, values)` returning `{ rows }`; a `pg.Pool` works as is (`npm install pg`; umio lists it as an optional peer dependency).
 - Correctness rests on the database only: every write is a single `UPDATE … WHERE` that checks the lease token, owner, expiry (by the database clock) and revision on the row it locks; fencing tokens come from one sequence, so they only grow, even across deleted and re-created runs; cancel requests are a flag and decisions a table keyed per request, writable by anyone without a lease.
 - Create the tables once: `PostgresCheckpointStore.migrate(pool, { schema?, tablePrefix? })` (idempotent, under an advisory lock), or run `postgresSchemaSql()` with your migration tool. Records are stored as `json`, verbatim.
-- `store.snapshot(runId)` and `store.snapshots({ status? })` read runs with their lease, cancel and decision state, for dashboards.
+- `store.snapshot(runId)` reads one run with its lease, cancel and decision state. `store.listRuns({ status?, awaitingApproval?, limit?, after? })` returns one page (default 200, newest first, ties by run ID) with a `next` cursor; filters run in the database, so no matching run is hidden behind newer ones. `store.snapshots(filter)` reads every page. Paging is stable on data that does not change; runs updated during a traversal move to the front.
 
 ```typescript
 import pg from "pg";
@@ -970,9 +1054,10 @@ npm run example:tools -- local     # streaming tool loop (UMIO_CONFIG=path to us
 npm run example:workflow -- local  # two-agent workflow with ADRs
 npm run example:project -- local   # agent answering questions about this repo with built-in tools
 npm run example:graph -- local     # diamond review graph with a conditional branch
+npm run example:skills -- local    # skills: explicit activation, then model selection
 ```
 
-For `test:postgres`, start a server first, e.g. `docker run -d -p 55432:5432 -e POSTGRES_USER=umio -e POSTGRES_PASSWORD=umio postgres:17-alpine`; the default URL is `postgres://umio:umio@localhost:55432/umio`.
+For `test:postgres`, start the server in `docker-compose.yml` first with `docker compose up -d --wait` (stop it with `docker compose down`). The default URL is `postgres://umio:umio@localhost:55432/umio`; set `UMIO_POSTGRES_PORT` to publish another host port, and point `UMIO_TEST_POSTGRES_URL` at it.
 
 Run a single test file or test name:
 

@@ -182,6 +182,52 @@ export const GraphConfigSchema = z
   })
   .strict();
 
+const skillName = z
+  .string()
+  .max(64)
+  .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, "must be a skill name like code-review");
+
+/**
+ * Local skills (docs/design/umio-skills-design.md): instruction packages the
+ * CLI and `skillsFromConfig` apply to agents. Nothing is permitted unless it
+ * is listed in `include`.
+ */
+export const SkillsConfigSchema = z
+  .object({
+    /** Directories whose immediate children are skills. Relative paths resolve against the config file's directory. */
+    roots: z.array(z.string().min(1)).min(1),
+    /** Permitted skills. Required; an empty list permits none. */
+    include: z.array(skillName),
+    /** Skills whose instructions go into the system prompt of every run. Must be in `include`. */
+    activate: z.array(skillName).optional(),
+    /** List the other permitted skills and let the model load one with `skills_load`. Default false. */
+    allowModelSelection: z.boolean().optional(),
+    /** Byte limits; defaults: 100 entries, 64 KiB per SKILL.md, 128 KiB per file, 256 KiB of prompt, 1 MiB read per run. */
+    limits: z
+      .object({
+        maxCatalogEntries: z.number().int().positive(),
+        maxDocumentBytes: z.number().int().positive(),
+        maxResourceBytes: z.number().int().positive(),
+        maxContextBytes: z.number().int().positive(),
+        maxReadBytes: z.number().int().positive(),
+      })
+      .partial()
+      .strict()
+      .optional(),
+  })
+  .strict()
+  .superRefine((skills, ctx) => {
+    for (const [index, name] of (skills.activate ?? []).entries()) {
+      if (!skills.include.includes(name)) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["activate", index],
+          message: `"${name}" is not in skills.include`,
+        });
+      }
+    }
+  });
+
 export const ModelConfigSchema = z
   .object({
     /** Key of an entry in `providers`. */
@@ -249,6 +295,8 @@ export const UmioConfigSchema = z
     adr: AdrConfigSchema.optional(),
     /** Graph workflow executor settings, applied by `WorkflowExecutor.fromConfig`. */
     graph: GraphConfigSchema.optional(),
+    /** Local skills: instruction packages for agents. */
+    skills: SkillsConfigSchema.optional(),
     /**
      * Named toolsets built from built-in (or registered) tool groups, e.g.
      * { "project-files": { "use": "files", "root": ".", "readOnly": true } }.
@@ -298,6 +346,7 @@ export type HarnessConfig = z.infer<typeof HarnessSchema>;
 export type MiddlewareSpec = z.infer<typeof MiddlewareSpecSchema>;
 export type AdrConfig = z.infer<typeof AdrConfigSchema>;
 export type GraphConfig = z.infer<typeof GraphConfigSchema>;
+export type SkillsConfig = z.infer<typeof SkillsConfigSchema>;
 export type UmioConfig = z.infer<typeof UmioConfigSchema> & {
   /** Directory of the config file; set by `loadConfig`. Relative tool paths resolve against it. */
   configDir?: string;

@@ -9,6 +9,7 @@ import {
   GraphNodeError,
   type GraphValidationError,
   type JsonValue,
+  type Lease,
   MemoryCheckpointStore,
   type NodeContext,
   type NodeHandler,
@@ -17,6 +18,7 @@ import {
   type WorkflowDefinition,
   WorkflowExecutor,
   type WorkflowExecutorOptions,
+  type WorkflowRun,
 } from "../src/index.js";
 import { FakeClock, settle } from "./support/fake-clock.js";
 import { controlled, ProcessStore, recorder, SECOND, track } from "./support/graph.js";
@@ -565,5 +567,164 @@ describe("loop nodes", () => {
     ).toContain(
       "cycle: a -> b -> a (graphs must be acyclic; repeat work with an explicit loop node)",
     );
+  });
+
+  describe("a loop that becomes uncertain stops new work (fix 2026-09-27 #1)", () => {
+    /** A one-node loop whose result is over its 32-byte limit on the first iteration. */
+    const bigLoop = (id: string): NodeSpec => ({
+      id,
+      maxOutputBytes: 32,
+      loop: {
+        body: { entry: ["x"], nodes: [{ id: "x", handler: "big" }], edges: [] },
+        until: "always",
+        maxIterations: 3,
+      },
+    });
+    /** A loop that needs two iterations. */
+    const twoRounds = (id: string): NodeSpec => ({
+      id,
+      loop: {
+        body: { entry: ["y"], nodes: [{ id: "y", handler: "round" }], edges: [] },
+        until: "second",
+        maxIterations: 3,
+      },
+    });
+    const predicates = {
+      always: () => true,
+      second: (output: JsonValue) => (output as { y: number }).y >= 2,
+    };
+
+    it("an independent ready task never starts, even with maxConcurrency 1; it runs once after recovery", async () => {
+      const { spawn } = world();
+      let sideEffects = 0;
+      const definition: WorkflowDefinition = {
+        graph: {
+          id: "wf",
+          version: "1",
+          entry: ["loop", "side"],
+          nodes: [bigLoop("loop"), { id: "side", handler: "side" }],
+          edges: [],
+        },
+        handlers: {
+          big: async () => "x".repeat(100),
+          side: async () => {
+            sideEffects += 1;
+            return "side effect";
+          },
+        },
+        predicates,
+      };
+      const executor = spawn({ maxConcurrency: 1 }).executor;
+      const parked = await executor.run(definition, null, { runId: "r1" });
+      expect(parked.status).toBe("needs-recovery");
+      expect(parked.nodes.loop).toMatchObject({
+        status: "uncertain",
+        uncertainReason: "invalid-output",
+      });
+      expect(parked.nodes.side).toMatchObject({ status: "pending", attempt: 0 });
+      expect(sideEffects).toBe(0);
+
+      await executor.recoverNode(definition, "r1", "loop", {
+        type: "complete",
+        output: { summary: "stored elsewhere" },
+      });
+      expect(sideEffects).toBe(0);
+      const done = await executor.resume(definition, "r1");
+      expect(done.status).toBe("completed");
+      expect(done.nodes.side?.status).toBe("completed");
+      expect(sideEffects).toBe(1);
+    });
+
+    it("once one loop is uncertain, another loop with a finished iteration does not advance", async () => {
+      const { clock, shared, spawn } = world();
+      let rounds = 0;
+      const definition: WorkflowDefinition = {
+        graph: {
+          id: "wf",
+          version: "1",
+          entry: ["a", "b"],
+          nodes: [bigLoop("a"), twoRounds("b")],
+          edges: [],
+        },
+        handlers: {
+          big: async () => "x".repeat(100),
+          round: async (context) => {
+            rounds += 1;
+            return context.loop?.iteration ?? 0;
+          },
+        },
+        predicates,
+      };
+      // A process dies right after both loops started: their first iterations are pending.
+      const crashing = spawn();
+      crashing.store.crashAfterWrite = (run) =>
+        run.nodes.a?.status === "running" && run.nodes.b?.status === "running";
+      void crashing.executor.run(definition, null, { runId: "r1" });
+      await settle();
+      await clock.advance(31 * SECOND);
+      // Fixture: both first iterations completed before the crash, neither decided yet.
+      const stored = (await shared.load("r1")) as WorkflowRun;
+      const lease = (await shared.acquireLease("r1", "fixture", 1_000)) as Lease;
+      await shared.compareAndSwap(
+        {
+          ...stored,
+          revision: stored.revision + 1,
+          nodes: {
+            ...stored.nodes,
+            "a#1/x": { nodeId: "a#1/x", status: "completed", attempt: 1, output: "x".repeat(100) },
+            "b#1/y": { nodeId: "b#1/y", status: "completed", attempt: 1, output: 1 },
+          },
+        },
+        stored.revision,
+        lease,
+      );
+      await shared.releaseLease(lease);
+
+      const parked = await spawn().executor.resume(definition, "r1");
+      expect(parked.status).toBe("needs-recovery");
+      expect(parked.nodes.a?.status).toBe("uncertain");
+      // b was not advanced: no decision recorded and no second iteration created or run.
+      expect(parked.nodes.b).toMatchObject({
+        status: "running",
+        loop: { iteration: 1, decisions: [] },
+      });
+      expect(parked.nodes["b#2/y"]).toBeUndefined();
+      expect(rounds).toBe(0);
+    });
+
+    it("attempts already running settle normally, then the run parks", async () => {
+      const { spawn } = world();
+      const slow = controlled();
+      const after = controlled();
+      const definition: WorkflowDefinition = {
+        graph: {
+          id: "wf",
+          version: "1",
+          entry: ["slow", "loop"],
+          nodes: [
+            { id: "slow", handler: "slow" },
+            bigLoop("loop"),
+            { id: "after", handler: "after" },
+          ],
+          edges: [{ from: "slow", to: "after" }],
+        },
+        handlers: { slow: slow.handler, big: async () => "x".repeat(100), after: after.handler },
+        predicates,
+      };
+      const run = track(
+        spawn({ maxConcurrency: 2 }).executor.run(definition, null, { runId: "r1" }),
+      );
+      await settle();
+      expect(slow.calls()).toBe(1);
+      expect(slow.aborted()).toBe(false); // not stopped because another node became uncertain
+      expect(run.settled).toBe(false);
+      slow.finish("done");
+      await settle();
+      expect(run.value?.status).toBe("needs-recovery");
+      expect(run.value?.nodes.slow?.status).toBe("completed");
+      // Its successor became ready, but nothing starts while a node is uncertain.
+      expect(run.value?.nodes.after?.status).toBe("pending");
+      expect(after.calls()).toBe(0);
+    });
   });
 });

@@ -50,6 +50,32 @@ export interface PostgresRunSnapshot {
   readonly decisions: readonly ApprovalDecision[];
 }
 
+/** Where the next page of `listRuns` starts. */
+export interface RunListCursor {
+  readonly updatedAt: number;
+  readonly runId: string;
+}
+
+export interface RunListQuery {
+  readonly runId?: string;
+  /** One status or several. */
+  readonly status?: RunStatus | readonly RunStatus[];
+  /** Only runs with an approval waiting for a decision (running, paused or needs-recovery). */
+  readonly awaitingApproval?: boolean;
+  /** Page size, 1–1000. Default 200. */
+  readonly limit?: number;
+  readonly after?: RunListCursor;
+}
+
+export interface RunPage {
+  readonly runs: PostgresRunSnapshot[];
+  /** Absent on the last page. */
+  readonly next?: RunListCursor;
+}
+
+const DEFAULT_PAGE_SIZE = 200;
+const MAX_PAGE_SIZE = 1_000;
+
 /** The schema version `migrate()` brings the tables to. */
 export const POSTGRES_STORE_SCHEMA_VERSION = 1;
 
@@ -289,39 +315,96 @@ export class PostgresCheckpointStore implements CheckpointStore {
 
   /** One run with its lease, control state and decisions; for inspection only. */
   async snapshot(runId: string): Promise<PostgresRunSnapshot | undefined> {
-    return (await this.snapshots({ runId }))[0];
+    return (await this.listRuns({ runId, limit: 1 })).runs[0];
   }
 
-  /** Runs, most recently updated first, optionally filtered by status. For inspection only. */
-  async snapshots(
-    filter: { runId?: string; status?: RunStatus; limit?: number } = {},
-  ): Promise<PostgresRunSnapshot[]> {
+  /**
+   * One page of runs, most recently updated first (ties by run ID), filtered
+   * in the database. Pass `next` back as `after` for the following page; it
+   * is absent after the last one. Pages follow a keyset on
+   * `(updated_at, run_id)`, so traversing a dataset that does not change
+   * returns every matching run exactly once; runs updated during a traversal
+   * move to the front and may be missed or seen twice. For inspection only.
+   */
+  async listRuns(query: RunListQuery = {}): Promise<RunPage> {
+    const limit = query.limit ?? DEFAULT_PAGE_SIZE;
+    if (!Number.isInteger(limit) || limit < 1 || limit > MAX_PAGE_SIZE) {
+      throw new UmioError(`limit must be an integer from 1 to ${MAX_PAGE_SIZE}, got ${limit}.`);
+    }
+    const statuses =
+      query.status === undefined
+        ? null
+        : Array.isArray(query.status)
+          ? query.status
+          : [query.status];
     const { rows } = await this.client.query(
       `WITH clock AS (SELECT ${NOW} AS now)
-       SELECT r.record, r.instance, r.cancel_requested, r.lease_owner, r.lease_expires_at,
+       SELECT r.run_id, r.updated_at, r.record, r.instance, r.cancel_requested, r.lease_owner,
+              r.lease_expires_at,
               (r.lease_token IS NOT NULL AND r.lease_expires_at > clock.now) AS lease_active,
               coalesce((SELECT json_agg(d.decision ORDER BY d.decided_at, d.request_id)
                         FROM ${this.decisions} d WHERE d.run_id = r.run_id), '[]'::json) AS decisions
        FROM ${this.runs} r, clock
-       WHERE ($2::text IS NULL OR r.run_id = $2) AND ($3::text IS NULL OR r.status = $3)
+       WHERE ($2::text IS NULL OR r.run_id = $2)
+         AND ($3::text[] IS NULL OR r.status = ANY($3::text[]))
+         AND (NOT $4::boolean OR (r.status IN ('running', 'paused', 'needs-recovery')
+              AND EXISTS (SELECT 1 FROM json_each(r.record -> 'nodes') n
+                          WHERE n.value ->> 'status' = 'waiting')))
+         AND ($5::bigint IS NULL OR r.updated_at < $5 OR (r.updated_at = $5 AND r.run_id > $6))
        ORDER BY r.updated_at DESC, r.run_id
-       LIMIT $4`,
-      [this.now(), filter.runId ?? null, filter.status ?? null, filter.limit ?? 1_000],
+       LIMIT $7`,
+      [
+        this.now(),
+        query.runId ?? null,
+        statuses,
+        query.awaitingApproval === true,
+        query.after?.updatedAt ?? null,
+        query.after?.runId ?? "",
+        limit + 1,
+      ],
     );
-    return rows.map((row) => {
-      const record = parseJson(row.record) as WorkflowRun;
-      assertCheckpointSchema(record);
-      return {
-        record,
-        instance: String(row.instance),
-        cancelRequested: row.cancel_requested === true,
-        ...(row.lease_owner !== null && {
-          lease: { ownerId: String(row.lease_owner), expiresAt: Number(row.lease_expires_at) },
-        }),
-        leaseActive: row.lease_active === true,
-        decisions: parseJson(row.decisions) as ApprovalDecision[],
-      };
-    });
+    const page = rows.slice(0, limit);
+    const last = page.at(-1);
+    return {
+      runs: page.map((row) => {
+        const record = parseJson(row.record) as WorkflowRun;
+        assertCheckpointSchema(record);
+        return {
+          record,
+          instance: String(row.instance),
+          cancelRequested: row.cancel_requested === true,
+          ...(row.lease_owner !== null && {
+            lease: { ownerId: String(row.lease_owner), expiresAt: Number(row.lease_expires_at) },
+          }),
+          leaseActive: row.lease_active === true,
+          decisions: parseJson(row.decisions) as ApprovalDecision[],
+        };
+      }),
+      ...(rows.length > limit &&
+        last && { next: { updatedAt: Number(last.updated_at), runId: String(last.run_id) } }),
+    };
+  }
+
+  /**
+   * Every matching run, in `listRuns` order: all pages are read, so nothing
+   * is cut off however many runs the store holds. For inspection only.
+   */
+  async snapshots(
+    filter: Omit<RunListQuery, "after" | "limit"> & { pageSize?: number } = {},
+  ): Promise<PostgresRunSnapshot[]> {
+    const { pageSize, ...query } = filter;
+    const runs: PostgresRunSnapshot[] = [];
+    let after: RunListCursor | undefined;
+    do {
+      const page = await this.listRuns({
+        ...query,
+        ...(pageSize !== undefined && { limit: pageSize }),
+        ...(after && { after }),
+      });
+      runs.push(...page.runs);
+      after = page.next;
+    } while (after);
+    return runs;
   }
 
   private now(): number | null {

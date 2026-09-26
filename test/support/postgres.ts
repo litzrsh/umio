@@ -3,7 +3,7 @@
  * (PostgreSQL compiled to WebAssembly, in process). The multi-client and
  * multi-process tests need a real server: set UMIO_TEST_POSTGRES_URL, e.g.
  *
- *   docker run -d -p 55432:5432 -e POSTGRES_PASSWORD=umio -e POSTGRES_USER=umio postgres:17-alpine
+ *   docker compose up -d --wait   (docker-compose.yml in the repository root)
  *   UMIO_TEST_POSTGRES_URL=postgres://umio:umio@localhost:55432/umio npm test
  */
 import { PGlite } from "@electric-sql/pglite";

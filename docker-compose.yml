@@ -1,0 +1,30 @@
+# PostgreSQL for umio's PostgresCheckpointStore: local development and
+# `npm run test:postgres` (which defaults to postgres://umio:umio@localhost:55432/umio).
+#
+#   docker compose up -d --wait      # start and wait until it accepts connections
+#   npm run test:postgres
+#   docker compose down              # stop (add -v to delete the data volume)
+#
+# Development credentials only; never reuse them for a real database.
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: umio-postgres
+    environment:
+      POSTGRES_USER: umio
+      POSTGRES_PASSWORD: umio
+      POSTGRES_DB: umio
+    ports:
+      # Host port 55432 avoids clashing with a PostgreSQL already on 5432.
+      - "127.0.0.1:${UMIO_POSTGRES_PORT:-55432}:5432"
+    volumes:
+      - umio-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U umio -d umio"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+volumes:
+  umio-postgres-data:
