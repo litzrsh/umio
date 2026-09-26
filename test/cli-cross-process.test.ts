@@ -111,7 +111,13 @@ describe("umio graph cancel from another process", () => {
 
     expect(await owner.exit).toBe(130);
     expect(owner.stderr()).toMatch(/cancel requested — stopping running nodes/);
-    expect(owner.stdout()).toMatch(/r1 · wf@1 · – cancelled/);
+    // The status symbol depends on the terminal ("–", or "-" with TERM=dumb), so it is not asserted.
+    const summary = owner
+      .stdout()
+      .split("\n")
+      .find((line) => line.startsWith("r1 "));
+    expect(summary).toContain("wf@1");
+    expect(summary).toMatch(/\bcancelled$/);
 
     const persisted = await FileCheckpointStore.snapshot(join(dir, ".umio", "runs"), "r1");
     expect(persisted?.record.status).toBe("cancelled");
