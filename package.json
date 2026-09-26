@@ -2,7 +2,7 @@
   "name": "umio",
   "version": "0.1.0",
   "description": "TypeScript-first AI orchestration library for multi-agent workflows.",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "type": "module",
   "engines": {
     "node": ">=20.18.1"

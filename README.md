@@ -1075,3 +1075,7 @@ npx vitest run -t "maps refusals"
 - **Validation:** Zod.
 - **Build:** tsup (esbuild) for dual ESM/CJS output.
 - **Tests and lint:** Vitest and Biome.
+
+## License
+
+Umio is licensed under the [Apache License, Version 2.0](LICENSE).
