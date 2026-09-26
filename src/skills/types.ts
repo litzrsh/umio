@@ -18,17 +18,31 @@ export interface LoadedSkill extends SkillSummary {
   readonly body: string;
 }
 
-/** Byte limits. They bound I/O and prompt growth; they are not model-token budgets. */
+/**
+ * Byte limits (UTF-8 bytes; not model tokens). Each says what it bounds:
+ * filesystem reads of one file, system-prompt text, or text returned by tools.
+ */
 export interface SkillLimits {
   /** Skills in one catalog. Default 100. */
   readonly maxCatalogEntries: number;
-  /** One `SKILL.md`. Default 64 KiB. */
+  /** Filesystem: one `SKILL.md` is never read beyond this. Default 64 KiB. */
   readonly maxDocumentBytes: number;
-  /** One resource file. Default 128 KiB. */
+  /** Filesystem: one resource file is never read beyond this. Default 128 KiB. */
   readonly maxResourceBytes: number;
-  /** System-prompt text added by one preparation. Default 256 KiB. */
+  /** System prompt: the text one preparation adds. Default 256 KiB. */
   readonly maxContextBytes: number;
-  /** Everything `skills_load` and `skills_read` return in one invocation, repeats included. Default 1 MiB. */
+  /**
+   * Tool output: the complete responses of `skills_load` and `skills_read` in
+   * one invocation, generated wrapper text and repeats included; a response
+   * that does not fit is refused, never truncated. Before reading a file, a
+   * call reserves the least it could return (for `skills_read`, the file's
+   * size, which is what it returns; for `skills_load`, its wrapper text), so
+   * a call that cannot fit is refused after a size check, without reading
+   * content. After reading, the reservation is settled to the exact response
+   * size atomically (concurrent calls never oversubscribe), and a failed call
+   * releases it. How much a call may read from disk is bounded by the per-file
+   * limits above, not by this budget. Default 1 MiB.
+   */
   readonly maxReadBytes: number;
 }
 

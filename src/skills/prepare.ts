@@ -74,6 +74,12 @@ export async function prepareSkills(
     }
     readBytes += bytes;
   };
+  /** Adjusts a reservation to the exact size returned; returns the new reservation. */
+  const settle = (reserved: number, exact: number, what: string): number => {
+    if (exact > reserved) reserve(exact - reserved, what);
+    else readBytes -= reserved - exact;
+    return exact;
+  };
   const activateSkill = (skill: LoadedSkill) => {
     const known = active.get(skill.name);
     if (known !== undefined && known !== skill.digest) {
@@ -139,15 +145,29 @@ export async function prepareSkills(
         }),
         annotations: { readOnly: true, idempotent: true },
         execute: async ({ name }, toolContext) => {
+          const invocationSignal = toolContext.signal ?? signal;
+          let reserved = 0;
           try {
             permitted(name);
-            const invocationSignal = toolContext.signal ?? signal;
-            const { skill, bytes } = await catalog.read(name, invocationSignal);
-            reserve(Buffer.byteLength(skill.body, "utf8"), `skill "${name}"`);
+            const summary = catalog.summary(name);
+            if (!summary) throw new SkillError(`Skill "${name}" is not in the catalog.`);
+            // The whole response counts, generated wrapper included. Its smallest
+            // possible size (the wrapper alone) is reserved before the content is
+            // read, so a call that cannot fit is refused without reading it; the
+            // exact size is then settled atomically, and refused if it does not fit.
+            const overhead = Buffer.byteLength(loadResponse({ ...summary, body: "" }), "utf8");
+            const { skill, bytes } = await catalog.read(name, invocationSignal, () => {
+              reserve(overhead, `skill "${name}"`);
+              reserved = overhead;
+            });
+            const response = loadResponse(skill);
+            reserved = settle(reserved, Buffer.byteLength(response, "utf8"), `skill "${name}"`);
             activateSkill(skill);
             emit({ type: "skill-loaded", name, digest: skill.digest, bytes, outcome: "ok" });
-            return `${renderSkill(skill)}\n\nThis skill is now active for this task.`;
+            return response;
           } catch (error) {
+            // A refused or failed load returns nothing, activates nothing and costs nothing.
+            readBytes -= reserved;
             emit({ type: "skill-loaded", name, outcome: "error", error: message(error) });
             throw error;
           }
@@ -181,6 +201,32 @@ export async function prepareSkills(
               );
             }
             const resolved = await resolveResource(catalog.dir(name), path);
+            if (await catalog.isDocument(name, resolved.file)) {
+              // SKILL.md is the instruction document, pinned by the catalog: read
+              // through the verified path, so a changed document is refused here
+              // exactly as by skills_load. It stays the document in usage, not a resource.
+              const document = await catalog.read(name, invocationSignal, (size) => {
+                reserve(size, `${name}/SKILL.md`);
+                reserved = size;
+              });
+              if (active.get(name) !== document.skill.digest) {
+                throw new SkillChangedError(`Skill "${name}" changed during this invocation.`);
+              }
+              reserved = settle(
+                reserved,
+                Buffer.byteLength(document.text, "utf8"),
+                `${name}/SKILL.md`,
+              );
+              emit({
+                type: "skill-resource-read",
+                name,
+                path: resolved.path,
+                digest: document.skill.digest,
+                bytes: document.bytes,
+                outcome: "ok",
+              });
+              return document.text;
+            }
             const read = await readBounded(resolved.file, catalog.limits.maxResourceBytes, {
               ...(invocationSignal && { signal: invocationSignal }),
               reserve: (size) => {
@@ -272,6 +318,11 @@ function names(value: unknown, field: string): string[] {
     throw new SkillSelectionError(`Skill selection ${field} must be a list of skill names.`);
   }
   return [...new Set(value as string[])].sort();
+}
+
+/** What `skills_load` returns: the wrapped document and a note that it is now active. */
+function loadResponse(skill: LoadedSkill): string {
+  return `${renderSkill(skill)}\n\nThis skill is now active for this task.`;
 }
 
 function renderSkill(skill: LoadedSkill): string {

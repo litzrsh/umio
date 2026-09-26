@@ -7,7 +7,7 @@ import { lstat, readdir, realpath, stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { SkillChangedError, SkillError, SkillSelectionError } from "./errors.js";
 import { readBounded, resolveResource, sha256 } from "./files.js";
-import { parseSkillDocument } from "./parse.js";
+import { decodeText, parseSkillDocument } from "./parse.js";
 import { prepareSkills } from "./prepare.js";
 import {
   DEFAULT_SKILL_LIMITS,
@@ -46,8 +46,19 @@ export interface CatalogAccess {
   names(): readonly string[];
   summary(name: string): SkillSummary | undefined;
   dir(name: string): string;
-  /** The document's bytes and parsed skill, checked against the catalog digest. */
-  read(name: string, signal?: AbortSignal): Promise<{ skill: LoadedSkill; bytes: number }>;
+  /**
+   * The document, checked against the catalog digest: the parsed skill and
+   * the full text, both from the exact bytes read. `reserve(size)` runs
+   * synchronously once the file size is known, before its content is read,
+   * and may throw to refuse.
+   */
+  read(
+    name: string,
+    signal?: AbortSignal,
+    reserve?: (size: number) => void,
+  ): Promise<{ skill: LoadedSkill; bytes: number; text: string }>;
+  /** Whether `file` is the skill's `SKILL.md` (the same file, whatever its spelling). */
+  isDocument(name: string, file: string): Promise<boolean>;
 }
 
 /**
@@ -195,10 +206,11 @@ class LocalSkillCatalog implements SkillCatalog {
       names: () => [...this.entries.keys()],
       summary: (name) => this.entries.get(name)?.summary,
       dir: (name) => require(name).dir,
-      read: async (name, signal) => {
+      read: async (name, signal, reserve) => {
         const entry = require(name);
         const read = await readBounded(entry.document, limits.maxDocumentBytes, {
           ...(signal && { signal }),
+          ...(reserve && { reserve }),
         });
         if (!read.ok || sha256(read.bytes) !== entry.summary.digest) {
           throw new SkillChangedError(
@@ -206,11 +218,20 @@ class LocalSkillCatalog implements SkillCatalog {
           );
         }
         const parsed = parseSkillDocument(read.bytes);
-        if (!parsed.ok) throw new SkillChangedError(`Skill "${name}" is no longer valid.`);
+        const text = decodeText(read.bytes);
+        if (!parsed.ok || text === undefined) {
+          throw new SkillChangedError(`Skill "${name}" is no longer valid.`);
+        }
         return {
           skill: Object.freeze({ ...entry.summary, body: parsed.skill.body }),
           bytes: read.bytes.length,
+          text,
         };
+      },
+      isDocument: async (name, file) => {
+        const entry = require(name);
+        const [a, b] = await Promise.all([stat(file), stat(entry.document)]).catch(() => []);
+        return a !== undefined && b !== undefined && a.dev === b.dev && a.ino === b.ino;
       },
     };
   }

@@ -6,4 +6,7 @@ Name reports `YYYY-MM-DD-HHmmss-problem-slug.md`, using the completion time in K
 
 Each report must link back to its original request in `../fix/`, document the actual source changes and validation results, and be linked from the corresponding row in [Fix Tracking](../fix.md).
 
-Reports: [2026-09-27 graph scheduling and PostgreSQL CLI fixes](2026-09-27-003702-graph-scheduling-and-postgres-cli-issues.md).
+Reports:
+
+- [2026-09-27 graph scheduling and PostgreSQL CLI fixes](2026-09-27-003702-graph-scheduling-and-postgres-cli-issues.md)
+- [2026-09-27 skill document integrity and read budget fixes](2026-09-27-012724-skill-document-integrity-and-read-budget.md)

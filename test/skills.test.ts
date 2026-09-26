@@ -2,7 +2,7 @@
  * Skill catalogs, parsing, selection and bounded resource reads
  * (docs/design/umio-skills-design.md §3–§6, §9).
  */
-import { mkdir, symlink, writeFile } from "node:fs/promises";
+import { link, mkdir, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
@@ -400,5 +400,188 @@ describe("resources", () => {
       (await invoke(prepared, "skills_read", { name: "code-review", path: "scripts/check.sh" }))
         .value,
     ).toBeDefined();
+  });
+});
+
+describe("SKILL.md through skills_read is pinned to the catalog version (fix 2026-09-27 01:22 #1)", () => {
+  async function demo(selection: { activate?: readonly string[]; allowModelSelection?: boolean }) {
+    const root = await tempRoot();
+    await writeTree(root, {
+      "skills/demo/SKILL.md": skillDocument("demo", "A"),
+      "skills/demo/notes.md": "N",
+    });
+    const catalog = await loadSkillCatalog({ roots: ["skills"], baseDir: root });
+    const prepared = await catalog.prepare({ include: ["demo"], ...selection });
+    if (selection.allowModelSelection) await invoke(prepared, "skills_load", { name: "demo" });
+    const change = () =>
+      writeFile(join(root, "skills/demo/SKILL.md"), skillDocument("demo", "CHANGED INSTRUCTIONS"));
+    return { root, catalog, prepared, change };
+  }
+
+  for (const [label, selection] of [
+    ["explicit activation", { activate: ["demo"] }],
+    ["activation through skills_load", { allowModelSelection: true }],
+  ] as const) {
+    it(`refuses a changed document after ${label}, like catalog.load, and keeps usage consistent`, async () => {
+      const { catalog, prepared, change } = await demo(selection);
+      const before = prepared.usage();
+      await change();
+      await expect(catalog.load("demo")).rejects.toBeInstanceOf(SkillChangedError);
+      const result = await invoke(prepared, "skills_read", { name: "demo", path: "SKILL.md" });
+      expect(result).toMatchObject({ errorType: "SkillChangedError" });
+      expect(JSON.stringify(result)).not.toContain("CHANGED INSTRUCTIONS");
+      expect(prepared.usage()).toEqual(before);
+      expect(prepared.usage()[0]).toMatchObject({
+        documentDigest: catalog.list()[0]?.digest,
+        resources: [],
+      });
+    });
+  }
+
+  it("returns an unchanged SKILL.md as the verified document, recorded as the document, not a resource", async () => {
+    const { catalog, prepared } = await demo({ activate: ["demo"] });
+    const result = await invoke(prepared, "skills_read", { name: "demo", path: "SKILL.md" });
+    expect(result).toEqual({ value: skillDocument("demo", "A") });
+    expect(prepared.usage()).toEqual([
+      { name: "demo", documentDigest: catalog.list()[0]?.digest, resources: [] },
+    ]);
+  });
+
+  it("recognizes the document under another name (a hard link), and still detects ordinary resource changes", async () => {
+    const { root, prepared, change } = await demo({ activate: ["demo"] });
+    await link(join(root, "skills/demo/SKILL.md"), join(root, "skills/demo/alias.md"));
+    expect((await invoke(prepared, "skills_read", { name: "demo", path: "notes.md" })).value).toBe(
+      "N",
+    );
+    await writeFile(join(root, "skills/demo/notes.md"), "N2");
+    expect(
+      (await invoke(prepared, "skills_read", { name: "demo", path: "notes.md" })).error,
+    ).toMatch(/changed since it was first read/);
+    await writeFile(
+      join(root, "skills/demo/alias.md"),
+      skillDocument("demo", "CHANGED INSTRUCTIONS"),
+    );
+    expect(await invoke(prepared, "skills_read", { name: "demo", path: "alias.md" })).toMatchObject(
+      {
+        errorType: "SkillChangedError",
+      },
+    );
+    void change;
+  });
+
+  it("a new catalog and preparation accept the updated document", async () => {
+    const { root, change } = await demo({ activate: ["demo"] });
+    await change();
+    const fresh = await loadSkillCatalog({ roots: ["skills"], baseDir: root });
+    const prepared = await fresh.prepare({ include: ["demo"], activate: ["demo"] });
+    expect(prepared.context[0]).toMatch(/CHANGED INSTRUCTIONS/);
+    expect(
+      (await invoke(prepared, "skills_read", { name: "demo", path: "SKILL.md" })).value,
+    ).toMatch(/CHANGED INSTRUCTIONS/);
+  });
+});
+
+describe("skills_load counts its whole response against maxReadBytes (fix 2026-09-27 01:22 #2)", () => {
+  /** A catalog with one `demo` skill whose body has non-ASCII text, and a checklist file. */
+  async function demoCatalog(maxReadBytes: number) {
+    const root = await tempRoot();
+    await writeTree(root, {
+      "skills/demo/SKILL.md": skillDocument("demo", "Prüfe ✓ A"),
+      "skills/demo/check.md": "0123456789",
+    });
+    return loadSkillCatalog({ roots: ["skills"], baseDir: root, limits: { maxReadBytes } });
+  }
+  const selection = { include: ["demo"], allowModelSelection: true };
+  async function responseBytes(): Promise<number> {
+    const prepared = await (await demoCatalog(1_000_000)).prepare(selection);
+    const { value } = await invoke(prepared, "skills_load", { name: "demo" });
+    return Buffer.byteLength(value ?? "", "utf8");
+  }
+
+  it("a one-byte budget refuses the load: nothing returned, activated, recorded or charged", async () => {
+    // The request's reproduction: a one-byte body `A` under a one-byte budget.
+    const root = await tempRoot();
+    await writeTree(root, {
+      "skills/demo/SKILL.md": skillDocument("demo", "A"),
+      "skills/demo/check.md": "x",
+    });
+    const catalog = await loadSkillCatalog({
+      roots: ["skills"],
+      baseDir: root,
+      limits: { maxReadBytes: 1 },
+    });
+    const events: { type: string; outcome?: string }[] = [];
+    const prepared = await catalog.prepare(selection, { onEvent: (event) => events.push(event) });
+    const result = await invoke(prepared, "skills_load", { name: "demo" });
+    expect(result).toMatchObject({
+      errorType: "SkillLimitError",
+      error: expect.stringMatching(/read budget/),
+    });
+    expect(
+      (await invoke(prepared, "skills_read", { name: "demo", path: "check.md" })).error,
+    ).toMatch(/not active yet/);
+    expect(prepared.usage()).toEqual([]);
+    expect(events.filter((event) => event.type === "skill-loaded")).toEqual([
+      expect.objectContaining({ outcome: "error" }),
+    ]);
+  });
+
+  it("fits at the exact UTF-8 length of the complete response, and is refused one byte below", async () => {
+    const bytes = await responseBytes();
+    expect(bytes).toBeGreaterThan(100); // the wrapper and note are counted, not just the body
+    const exact = await (await demoCatalog(bytes)).prepare(selection);
+    const ok = await invoke(exact, "skills_load", { name: "demo" });
+    expect(Buffer.byteLength(ok.value ?? "", "utf8")).toBe(bytes);
+    const short = await (await demoCatalog(bytes - 1)).prepare(selection);
+    expect((await invoke(short, "skills_load", { name: "demo" })).errorType).toBe(
+      "SkillLimitError",
+    );
+  });
+
+  it("repeated and parallel loads never return more than the budget", async () => {
+    const bytes = await responseBytes();
+    const prepared = await (await demoCatalog(bytes * 2 + bytes - 1)).prepare(selection);
+    const results = await Promise.all(
+      [1, 2, 3, 4, 5].map(() => invoke(prepared, "skills_load", { name: "demo" })),
+    );
+    const returned = results.reduce(
+      (total, item) => total + Buffer.byteLength(item.value ?? "", "utf8"),
+      0,
+    );
+    expect(results.filter((item) => item.value !== undefined)).toHaveLength(2);
+    expect(returned).toBeLessThanOrEqual(bytes * 3 - 1);
+  });
+
+  it("loads and reads share one budget; a refused call leaves the rest of it usable", async () => {
+    const bytes = await responseBytes();
+    const prepared = await (await demoCatalog(bytes + 10)).prepare(selection);
+    expect((await invoke(prepared, "skills_load", { name: "demo" })).value).toBeDefined();
+    // A second load does not fit (10 bytes left) and is refused without charge…
+    expect((await invoke(prepared, "skills_load", { name: "demo" })).errorType).toBe(
+      "SkillLimitError",
+    );
+    // …so the 10-byte file still fits exactly, and then nothing more does.
+    expect(await invoke(prepared, "skills_read", { name: "demo", path: "check.md" })).toEqual({
+      value: "0123456789",
+    });
+    expect(
+      (await invoke(prepared, "skills_read", { name: "demo", path: "check.md" })).error,
+    ).toMatch(/read budget/);
+  });
+
+  it("refuses an over-budget load from the file size, before reading its content", async () => {
+    const root = await tempRoot();
+    await writeTree(root, { "skills/demo/SKILL.md": skillDocument("demo", "A") });
+    const catalog = await loadSkillCatalog({
+      roots: ["skills"],
+      baseDir: root,
+      limits: { maxReadBytes: 1 },
+    });
+    const prepared = await catalog.prepare(selection);
+    // The content changed too, but the budget check comes first: no content was read.
+    await writeFile(join(root, "skills/demo/SKILL.md"), skillDocument("demo", "B"));
+    expect((await invoke(prepared, "skills_load", { name: "demo" })).errorType).toBe(
+      "SkillLimitError",
+    );
   });
 });

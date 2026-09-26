@@ -9,6 +9,8 @@ Track required fixes and link their implementation results here. Pending finding
 | New tasks start after a loop becomes uncertain | P1 | [Details](fix/2026-09-27-002407-graph-scheduling-and-postgres-cli-issues.md#1-p1-new-tasks-start-after-a-loop-becomes-uncertain) | Completed | [Report](fix_complete/2026-09-27-003702-graph-scheduling-and-postgres-cli-issues.md#1-new-tasks-start-after-a-loop-becomes-uncertain-p1) |
 | PostgreSQL passwords appear in CLI output | P1 | [Details](fix/2026-09-27-002407-graph-scheduling-and-postgres-cli-issues.md#2-p1-postgresql-passwords-appear-in-cli-output) | Completed | [Report](fix_complete/2026-09-27-003702-graph-scheduling-and-postgres-cli-issues.md#2-postgresql-passwords-appear-in-cli-output-p1) |
 | Older pending approvals disappear from PostgreSQL listings | P2 | [Details](fix/2026-09-27-002407-graph-scheduling-and-postgres-cli-issues.md#3-p2-older-pending-approvals-disappear-from-postgresql-listings) | Completed | [Report](fix_complete/2026-09-27-003702-graph-scheduling-and-postgres-cli-issues.md#3-older-pending-approvals-disappear-from-postgresql-listings-p2) |
+| Resource reads bypass SKILL.md version validation | P2 | [Details](fix/2026-09-27-012222-skill-document-integrity-and-read-budget.md#1-p2-resource-reads-bypass-skillmd-version-validation) | Completed | [Report](fix_complete/2026-09-27-012724-skill-document-integrity-and-read-budget.md#1-resource-reads-bypass-skillmd-version-validation-p2) |
+| Skill load responses exceed the declared read budget | P2 | [Details](fix/2026-09-27-012222-skill-document-integrity-and-read-budget.md#2-p2-skill-load-responses-exceed-the-declared-read-budget) | Completed | [Report](fix_complete/2026-09-27-012724-skill-document-integrity-and-read-budget.md#2-skill-load-responses-exceed-the-declared-read-budget-p2) |
 
 Each request identifies the affected source files, reproduction steps, expected behavior, proposed changes, and regression coverage.
 
@@ -37,3 +39,4 @@ Mark a finding `Completed` only when its acceptance criteria are met. If work re
 ## Completion Reports
 
 - [Graph scheduling and PostgreSQL CLI fixes](fix_complete/2026-09-27-003702-graph-scheduling-and-postgres-cli-issues.md) — 2026-09-27 00:37:02 KST; findings 1–3 of the [2026-09-27 request](fix/2026-09-27-002407-graph-scheduling-and-postgres-cli-issues.md).
+- [Skill document integrity and read budget fixes](fix_complete/2026-09-27-012724-skill-document-integrity-and-read-budget.md) — 2026-09-27 01:27:24 KST; findings 1–2 of the [2026-09-27 01:22 request](fix/2026-09-27-012222-skill-document-integrity-and-read-budget.md).
