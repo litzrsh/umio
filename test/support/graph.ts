@@ -28,6 +28,8 @@ const never = <T>() => new Promise<T>(() => {});
  * One simulated process's view of a shared store. After `crash()` every call
  * it makes hangs forever: its timers stop re-arming and it writes nothing
  * more, as if the process had died. Records writes, leases and renewals.
+ * `beforeWrite` can hold a write open, and `failures` makes an operation
+ * reject once.
  */
 export class ProcessStore implements CheckpointStore {
   crashed = false;
@@ -36,6 +38,10 @@ export class ProcessStore implements CheckpointStore {
   readonly writes: WorkflowRun[] = [];
   readonly leases: Lease[] = [];
   renewals = 0;
+  /** Awaited before a compare-and-swap reaches the store, e.g. to hold W1 open. */
+  beforeWrite?: (run: WorkflowRun) => Promise<void> | void;
+  /** Operations (by method name) that reject once with the given error. */
+  readonly failures = new Map<keyof CheckpointStore, Error>();
 
   constructor(readonly inner: CheckpointStore) {}
 
@@ -43,13 +49,18 @@ export class ProcessStore implements CheckpointStore {
     this.crashed = true;
   }
 
-  private call<T>(operation: () => Promise<T>): Promise<T> {
+  private call<T>(name: keyof CheckpointStore, operation: () => Promise<T>): Promise<T> {
     if (this.crashed) return never();
+    const failure = this.failures.get(name);
+    if (failure) {
+      this.failures.delete(name);
+      return Promise.reject(failure);
+    }
     return operation().then((value) => (this.crashed ? never<T>() : value));
   }
 
   create(run: WorkflowRun, ownerId: string, ttlMs: number) {
-    return this.call(async () => {
+    return this.call("create", async () => {
       const lease = await this.inner.create(run, ownerId, ttlMs);
       this.writes.push(run);
       this.leases.push(lease);
@@ -57,10 +68,11 @@ export class ProcessStore implements CheckpointStore {
     });
   }
   load(runId: string) {
-    return this.call(() => this.inner.load(runId));
+    return this.call("load", () => this.inner.load(runId));
   }
   compareAndSwap(run: WorkflowRun, expected: number, lease: Lease) {
-    return this.call(async (): Promise<CasResult> => {
+    return this.call("compareAndSwap", async (): Promise<CasResult> => {
+      await this.beforeWrite?.(run);
       const result = await this.inner.compareAndSwap(run, expected, lease);
       if (result === "ok") {
         this.writes.push(run);
@@ -70,7 +82,7 @@ export class ProcessStore implements CheckpointStore {
     });
   }
   acquireLease(runId: string, ownerId: string, ttlMs: number) {
-    return this.call(async () => {
+    return this.call("acquireLease", async () => {
       const lease = await this.inner.acquireLease(runId, ownerId, ttlMs);
       if (lease) this.leases.push(lease);
       return lease;
@@ -78,19 +90,19 @@ export class ProcessStore implements CheckpointStore {
   }
   renewLease(lease: Lease, ttlMs: number) {
     this.renewals += 1;
-    return this.call(() => this.inner.renewLease(lease, ttlMs));
+    return this.call("renewLease", () => this.inner.renewLease(lease, ttlMs));
   }
   releaseLease(lease: Lease) {
-    return this.call(() => this.inner.releaseLease(lease));
+    return this.call("releaseLease", () => this.inner.releaseLease(lease));
   }
   requestCancel(runId: string) {
-    return this.call(() => this.inner.requestCancel(runId));
+    return this.call("requestCancel", () => this.inner.requestCancel(runId));
   }
   isCancelRequested(runId: string) {
-    return this.call(() => this.inner.isCancelRequested(runId));
+    return this.call("isCancelRequested", () => this.inner.isCancelRequested(runId));
   }
   delete(runId: string) {
-    return this.call(() => this.inner.delete(runId));
+    return this.call("delete", () => this.inner.delete(runId));
   }
 
   /** Writes that left the run in a status other than `running`. */

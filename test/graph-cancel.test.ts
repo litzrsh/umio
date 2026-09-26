@@ -260,6 +260,103 @@ describe("cancel requests between attempts", () => {
     expect(run.status).toBe("cancelled");
     expect(run.nodes).toMatchObject({ a: { status: "completed" }, b: { status: "pending" } });
   });
+
+  /** Holds the first W1 of node `a` open until `open()` is called. */
+  const holdW1 = (store: ProcessStore) => {
+    let open = () => {};
+    const gate = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    let held = false;
+    store.beforeWrite = async (run) => {
+      if (held || run.nodes.a?.status !== "running") return;
+      held = true;
+      await gate;
+    };
+    return { open, held: () => held };
+  };
+
+  // Persisted state when the cancel wins at this boundary: W1 stays written
+  // (the attempt counts), then W4 records the node `cancelled`, not
+  // `uncertain`, because its handler never ran; the run ends `cancelled`.
+  // No node-start is reported.
+  it("win when received while W1 is being written: the handler never starts", async () => {
+    const { shared, spawn } = world();
+    const { store, executor } = spawn();
+    const w1 = holdW1(store);
+    const a = controlled();
+    const events = recorder();
+    const run = track(
+      executor.run(graph(nodes("a"), [], { a: a.handler }), null, {
+        runId: "r1",
+        observer: events.observer,
+      }),
+    );
+    await settle();
+    expect(w1.held()).toBe(true);
+    await expect(executor.cancel("r1")).resolves.toMatchObject({ outcome: "requested" });
+    w1.open();
+    await settle();
+
+    expect(a.calls()).toBe(0);
+    expect(run.value?.status).toBe("cancelled");
+    expect(run.value?.nodes.a).toMatchObject({ status: "cancelled", attempt: 1 });
+    expect(run.value?.nodes.a?.uncertainReason).toBeUndefined();
+    await expect(shared.load("r1")).resolves.toEqual(run.value);
+    expect(store.writes.map((write) => [write.status, write.nodes.a?.status])).toEqual([
+      ["running", "pending"], // W0
+      ["running", "running"], // W1
+      ["running", "cancelled"], // W4
+      ["cancelled", "cancelled"], // W5
+    ]);
+    expect(events.summary()).toEqual([
+      "run-start",
+      "run-cancel-requested",
+      "node-finish:a:cancelled",
+      "run-finish:cancelled",
+    ]);
+  });
+
+  it("win the same way when recorded by another executor during W1, without waiting for the poll", async () => {
+    const { spawn } = world();
+    const owner = spawn();
+    const other = spawn();
+    const w1 = holdW1(owner.store);
+    const a = controlled();
+    const run = track(
+      owner.executor.run(graph(nodes("a"), [], { a: a.handler }), null, { runId: "r1" }),
+    );
+    await settle();
+    await expect(other.executor.cancel("r1")).resolves.toMatchObject({ outcome: "requested" });
+    w1.open();
+    await settle(); // no clock advance: the poll never ran
+
+    expect(a.calls()).toBe(0);
+    expect(run.value?.status).toBe("cancelled");
+    expect(run.value?.nodes.a).toMatchObject({ status: "cancelled", attempt: 1 });
+  });
+
+  it("win the same way when the run's signal aborts during W1", async () => {
+    const { spawn } = world();
+    const { store, executor } = spawn();
+    const w1 = holdW1(store);
+    const a = controlled();
+    const controller = new AbortController();
+    const run = track(
+      executor.run(graph(nodes("a"), [], { a: a.handler }), null, {
+        runId: "r1",
+        signal: controller.signal,
+      }),
+    );
+    await settle();
+    controller.abort();
+    w1.open();
+    await settle();
+
+    expect(a.calls()).toBe(0);
+    expect(run.value?.status).toBe("cancelled");
+    expect(run.value?.nodes.a?.status).toBe("cancelled");
+  });
 });
 
 describe("cancel versus failure (I9)", () => {

@@ -35,6 +35,7 @@ import {
   predecessorOutputs,
   readyNodes,
   recoverOrphans,
+  rejectOutput,
   retryNode,
   startAttempt,
 } from "./plan.js";
@@ -118,7 +119,10 @@ export interface GraphRunOptions {
   readonly onObserverError?: (error: unknown, event: GraphRunEvent) => void;
 }
 
-type Outcome = { ok: true; output: JsonValue } | { ok: false; error: NodeError };
+/** `invalidOutput`: the handler returned, but its output failed the checks. */
+type Outcome =
+  | { ok: true; output: JsonValue }
+  | { ok: false; error: NodeError; invalidOutput?: true };
 
 type Halt = { kind: "failed"; nodeId: NodeId; error: NodeError } | { kind: "cancelled" };
 
@@ -378,8 +382,11 @@ export class WorkflowExecutor {
   /**
    * Resolves an `uncertain` node of a `needs-recovery` run, after you have
    * checked what its interrupted attempt actually did (its side effects are
-   * keyed by `idempotencyKey`). It never starts attempts: call `resume()`
-   * afterwards to continue the run.
+   * keyed by `idempotencyKey`). A node whose handler returned an invalid
+   * output (`uncertainReason: "invalid-output"`, e.g. over `maxOutputBytes`)
+   * is resolved the same way, typically with `complete` and an `ArtifactRef`
+   * to the result. It never starts attempts: call `resume()` afterwards to
+   * continue the run.
    *
    * - `retry`: the node runs again on resume, even beyond its retry budget.
    * - `complete`: the node completes with `output` (checked like a handler's)
@@ -395,26 +402,24 @@ export class WorkflowExecutor {
     action: RecoveryAction,
   ): Promise<WorkflowRun> {
     validateDefinition(definition);
-    let { record, lease } = await this.takeOver(definition, runId, ["needs-recovery"]);
+    const { record, lease } = await this.takeOver(definition, runId, ["needs-recovery"]);
     try {
       if (await this.store.isCancelRequested(runId)) {
-        record = await this.write(record, finalizeCancel(record, this.deps.now()), lease); // W7
-        await this.release(lease);
-        return record;
+        return await this.write(record, finalizeCancel(record, this.deps.now()), lease); // W7
       }
       const decisions = this.recoveryDecisions(definition, record, nodeId, action);
-      record = await this.write(
+      return await this.write(
         record,
         applyRecovery(definition.graph, record, nodeId, action, decisions, this.deps.now()),
         lease,
       ); // W8
-    } catch (error) {
-      // An invalid action writes nothing; the lease can go back at once.
-      if (error instanceof RecoveryNotApplicableError) await this.release(lease);
-      throw error;
+    } finally {
+      // Released on every path, so a failed call never blocks the next one until
+      // the lease expires. Nothing runs under it, and a write that may have
+      // landed is re-read by the next owner. A release error never masks the
+      // original one.
+      await this.release(lease);
     }
-    await this.release(lease);
-    return record;
   }
 
   /** Checks a recovery action against the run and, for `complete`, decides the node's edges. */
@@ -725,6 +730,15 @@ export class WorkflowExecutor {
             }
             await commit(startAttempt(record, nodeId, now())); // W1, before the handler
             const attempt = record.nodes[nodeId]?.attempt ?? 1;
+            // A request that arrived while W1 was being written (locally, by
+            // signal, or in the control record) wins: the handler never runs,
+            // so the attempt is recorded as cancelled, not uncertain (W4).
+            if (!cancelRequested && (await this.cancelPending(runId))) noticeCancel();
+            if (cancelRequested) {
+              await commit(cancelAttempt(record, nodeId, now()));
+              finished(nodeId, "cancelled");
+              break;
+            }
             // Queued before the handler runs, so its own events follow this one.
             queue.push({ type: "node-start", runId, nodeId, attempt, at: now() });
             launch(nodeId, attempt);
@@ -813,6 +827,10 @@ export class WorkflowExecutor {
             finished(nodeId, "failed");
             if (!halt) startHalt({ kind: "failed", nodeId, error: decided.error });
           }
+        } else if (outcome.invalidOutput) {
+          // The handler returned, so its effects happened: park it for recoverNode (W2′).
+          await commit(rejectOutput(record, nodeId, outcome.error, now()));
+          finished(nodeId, "uncertain");
         } else if (halt) {
           // Stopped because the run was already failing or being cancelled (W4).
           await commit(cancelAttempt(record, nodeId, now()));
@@ -896,7 +914,9 @@ export class WorkflowExecutor {
       nodeId,
       idempotencyKey: context.idempotencyKey,
     });
-    return invalid ? { ok: false, error: invalid } : { ok: true, output: output as JsonValue };
+    return invalid
+      ? { ok: false, error: invalid, invalidOutput: true }
+      : { ok: true, output: output as JsonValue };
   }
 }
 

@@ -131,13 +131,26 @@ Set `"local": true` or `false` to override the classification. Hosted gateways s
 
 | Limit | What it limits | Default |
 |---|---|---|
-| Node timeout (`graph.nodeTimeoutMs`, per-node `timeoutMs`) | One graph node attempt, wall clock, including time spent waiting for a request slot | 3 h |
+| Node timeout (`graph.nodeTimeoutMs`, per-node `timeoutMs`) | One graph node attempt, wall clock, including time spent waiting for a request slot. For an agent node that is the **whole agent run**: every model call and tool call | 3 h |
 | Provider `timeoutMs` | One HTTP request, from sending it to its response headers | Local: 3 h 5 min |
 | `transport.headersTimeoutMs` / `bodyTimeoutMs` | Node's `fetch`: time to headers, and gaps between body chunks | Local: equal to `timeoutMs` |
 | Inactivity timeout (per-node `inactivityTimeoutMs`) | Time without progress events | Off |
 | Lease (`graph.leaseTtlMs`, renewed every `leaseRenewIntervalMs`) | Proof that the executor process is alive; not a limit on node duration | 30 s, renewed every 10 s |
 | Tool-loop `maxSteps`, built-in tool timeouts | Model calls per loop; one tool call | Unchanged |
 
+- **Multi-turn agents need a longer node timeout.** The 3 h default fits one long local request, but an agent node makes a model call per tool-loop step, and on modest hardware a single request can itself take 2–3 hours. Give such nodes their own limit, and leave the provider and transport timeouts sized for **one** request:
+
+  ```typescript
+  nodes: [
+    // Up to ~4 model calls of up to 3 h each, plus tool calls.
+    { id: "implement", handler: "implement", timeoutMs: 12 * 60 * 60 * 1000 },
+    // No node limit: each request is still bounded by the provider's timeoutMs
+    // and transport timeouts, and the loop by maxSteps; cancel() still works.
+    { id: "review", handler: "review", timeoutMs: null },
+  ],
+  ```
+
+  Prefer per-node `timeoutMs` over raising `graph.nodeTimeoutMs` for every node. A higher `graph.nodeTimeoutMs` also triggers the warning below unless the provider's `timeoutMs` is raised to match, which is only needed if one request can really take that long.
 - `WorkflowExecutor.fromConfig()` and `agentNode()` emit a process warning (`UMIO_PROVIDER_TIMEOUT_BELOW_NODE_TIMEOUT`) when a local provider's request timeout is below the node timeout, since the provider would then end long calls first.
 - Recommended for one local model: `stream: true` on agent nodes (bytes keep flowing and progress is reported), and `"graph": { "maxConcurrency": 1 }`, so graph nodes don't wait behind each other's calls and use up their node timeouts.
 - Avoid CPU-bound work inside handlers. Inference runs in the model server, but a JavaScript event loop blocked for more than about 20 s misses lease renewals, and the run is then taken away from the executor.
@@ -468,6 +481,7 @@ run.nodes.merge?.output;  // { text, usage } from agentNode
 
 **Time limits**
 - Each attempt has a wall-clock **node timeout**: 3 h by default (`nodeTimeoutMs` on the executor or in the config's `graph` section), `timeoutMs` per node, `null` for none. `context.deadline` tells the handler when it ends.
+- The node timeout covers the **entire attempt**. For `agentNode` that is the whole agent run: every model request, tool call and wait for a request slot. A multi-turn agent on a slow local model needs a per-node `timeoutMs` well above 3 h, or `null` (see [Time limits for long local runs](#local-providers)).
 - `inactivityTimeoutMs` (per node, off by default) limits the time between progress events (`context.emit`, which `agentNode` calls for every agent event). Keep it off or generous for local models: a long prompt prefill emits nothing.
 - On expiry the attempt's `signal` aborts and the attempt fails with a retryable `timeout` error; a result that arrives after that is discarded.
 - **A handler that ignores its signal** is given `cancelGraceMs` (10 s) to stop, then **abandoned**: its node becomes `uncertain` (see below), because umio cannot know what it did, and nothing new starts. The run parks as `needs-recovery` once the other running nodes finish. JavaScript cannot be stopped from outside, so the abandoned promise keeps running in the background and its result is ignored. Handlers doing long work must honor `context.signal`.
@@ -479,6 +493,7 @@ run.nodes.merge?.output;  // { text, usage } from agentNode
   - `cancelled`: nobody owned the run (its owner crashed and its lease expired, or it was parked), so this call finalized it; nodes left running become `uncertain`;
   - `already-terminal` or `not-found`.
 - Aborting `GraphRunOptions.signal` cancels the run the same way.
+- A request is checked before each node's attempt is recorded and again right after, before its handler starts. If it arrives while that record is being written, the handler never runs: the node is recorded `cancelled` (its attempt counted), not `uncertain`.
 - Nodes that stop within `cancelGraceMs` are recorded `cancelled`; the others are abandoned and become `uncertain`. The run is `cancelled` either way, and `run()` resolves without waiting for abandoned handlers.
 - A failure and a cancel never both apply: whichever the executor processes first decides the run's status.
 
@@ -489,6 +504,7 @@ run.nodes.merge?.output;  // { text, usage } from agentNode
 
 **Outputs**
 - Outputs must be JSON and at most `maxOutputBytes` (default 256 KiB; configurable per executor, per node, or in the config's `graph` section).
+- An output that fails these checks is not a plain failure: the handler has returned, so its side effects happened. The node becomes `uncertain` with `uncertainReason: "invalid-output"` and the check's error (`output-too-large` or `output-not-json`), and the run parks as `needs-recovery` once other running nodes finish. It is never retried automatically, even with `recovery: "retry"`. Store the result, then `recoverNode(…, { type: "complete", output: artifactRef })` and `resume()`; or `retry` if re-running is safe, or `fail`. (If the run was already failing or being cancelled, it still ends that way, with the node left `uncertain`.)
 - For larger results, store the data yourself and return an `ArtifactRef` (`{ $artifact: { uri, sha256, bytes, mediaType? } }`). umio never reads or deletes artifacts; retention is yours, and `collectArtifactRefs(run)` lists them.
 
 **Checkpoints and leases**

@@ -220,6 +220,32 @@ export function abandonAttempt(
   );
 }
 
+/**
+ * W2′ (invalid output): the handler returned, so its side effects happened, but
+ * its output cannot be checkpointed. The node becomes `uncertain` rather than
+ * `failed`, so `recoverNode()` can supply a valid output (e.g. an `ArtifactRef`)
+ * after checking the effect. It is never retried automatically, whatever its
+ * `recovery` policy; the run parks (W5′) once nothing runs.
+ */
+export function rejectOutput(
+  run: WorkflowRun,
+  nodeId: NodeId,
+  error: NodeError,
+  now: number,
+): WorkflowRun {
+  const node = requireNode(run, nodeId);
+  return bump(
+    withNode(run, {
+      ...node,
+      status: "uncertain",
+      uncertainReason: "invalid-output",
+      error,
+      finishedAt: now,
+    }),
+    now,
+  );
+}
+
 /** W4: an attempt stopped because the run is failing or being cancelled. */
 export function cancelAttempt(run: WorkflowRun, nodeId: NodeId, now: number): WorkflowRun {
   const node = requireNode(run, nodeId);
@@ -310,7 +336,7 @@ export function applyRecovery(
       next = withNode(run, { ...pendingAgain(node, now), recoveries });
       break;
     case "complete": {
-      const { uncertainReason: _, ...rest } = node;
+      const { uncertainReason: _, error: __, ...rest } = node;
       // completeNode records the W2 contents and bumps the revision itself.
       next = completeNode(
         graph,

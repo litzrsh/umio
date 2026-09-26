@@ -439,11 +439,16 @@ describe("failure while nodes run concurrently", () => {
 describe("output limits", () => {
   const big = "x".repeat(300_000);
 
-  it("fails oversized output as non-retryable, with configurable limits", async () => {
+  it("parks oversized output as uncertain (invalid-output), with configurable limits", async () => {
     const single = (spec = {}) =>
       definition({ entry: ["a"], nodes: [node("a", spec)], edges: [] }, { a: async () => big });
 
     const tooBig = await executor().run(single(), null);
+    expect(tooBig.status).toBe("needs-recovery");
+    expect(tooBig.nodes.a).toMatchObject({
+      status: "uncertain",
+      uncertainReason: "invalid-output",
+    });
     expect(tooBig.nodes.a?.error).toMatchObject({ code: "output-too-large", retryable: false });
     expect(tooBig.nodes.a?.error?.message).toMatch(
       /300002 bytes, over the 262144-byte limit.*ArtifactRef/,

@@ -145,6 +145,14 @@ describe("Workflow", () => {
     await expect(new Workflow({ llm: model }).run()).rejects.toThrow(/no steps/);
   });
 
+  it("rejects a step whose output is over the checkpoint limit, naming the limit", async () => {
+    const writer = new Agent({ name: "Writer", role: "r" });
+    const { model } = scriptedModel({ Writer: [text("x".repeat(300_000))] });
+    await expect(new Workflow({ llm: model, adr: false }).step(writer).run()).rejects.toThrow(
+      /over the 262144-byte limit/,
+    );
+  });
+
   it("shares state between steps and tools", async () => {
     const remember = tool({
       name: "remember",

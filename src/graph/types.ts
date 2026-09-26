@@ -134,7 +134,13 @@ export interface NodeRun {
     | "process-lost"
     | "abandoned-timeout"
     | "abandoned-cancel"
-    | "abandoned-failure";
+    | "abandoned-failure"
+    /**
+     * The handler returned, but its output failed the checks (not JSON, or over
+     * `maxOutputBytes`). Its side effects happened; `error` says why the output
+     * was rejected. Never retried automatically: resolve it with `recoverNode()`.
+     */
+    | "invalid-output";
   readonly recoveries?: readonly { action: "retry" | "complete" | "fail"; at: number }[];
   readonly startedAt?: number;
   readonly finishedAt?: number;

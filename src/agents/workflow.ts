@@ -161,7 +161,11 @@ export class Workflow {
       input,
     );
     if (record.status !== "completed") {
-      throw failure?.error ?? new UmioError(record.error?.message ?? `Workflow ${record.status}.`);
+      // A rejected output parks the run with the reason on the node, not the run.
+      const reason =
+        record.error?.message ??
+        Object.values(record.nodes).find((node) => node.status === "uncertain")?.error?.message;
+      throw failure?.error ?? new UmioError(reason ?? `Workflow ${record.status}.`);
     }
 
     return {

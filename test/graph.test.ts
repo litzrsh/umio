@@ -430,7 +430,7 @@ describe("WorkflowExecutor (sequential behavior)", () => {
     expect(long.length).toBe(1_000);
   });
 
-  it("fails a node that returns non-JSON output, as non-retryable", async () => {
+  it("parks a node that returns non-JSON output for recovery, as non-retryable", async () => {
     const def = definition(
       { entry: ["a"], nodes: [{ id: "a", handler: "h" }], edges: [] },
       {
@@ -438,6 +438,8 @@ describe("WorkflowExecutor (sequential behavior)", () => {
       },
     );
     const run = await executor().run(def, null);
+    expect(run.status).toBe("needs-recovery");
+    expect(run.nodes.a).toMatchObject({ status: "uncertain", uncertainReason: "invalid-output" });
     expect(run.nodes.a?.error).toMatchObject({ code: "output-not-json", retryable: false });
     expect(run.nodes.a?.error?.message).toMatch(/idempotency key/);
   });

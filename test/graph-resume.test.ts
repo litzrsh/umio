@@ -219,15 +219,16 @@ describe("crash simulations", () => {
   });
 });
 
-describe("recoverNode", () => {
-  const parked = async () => {
-    const effects = { count: 0 };
-    const w = await crashed((handlers) => chain(handlers), effectThenCrash(effects));
-    const executor = w.spawn().executor;
-    await executor.resume(w.definition, "r1");
-    return { ...w, executor, effects };
-  };
+/** Run "r1" parked with `a` uncertain after a crash, seen from a fresh process. */
+const parked = async () => {
+  const effects = { count: 0 };
+  const w = await crashed((handlers) => chain(handlers), effectThenCrash(effects));
+  const { store, executor } = w.spawn();
+  await executor.resume(w.definition, "r1");
+  return { ...w, store, executor, effects };
+};
 
+describe("recoverNode", () => {
   it("retry: runs the node again with the same idempotency key, beyond its budget", async () => {
     const { executor, definition, calls } = await parked();
     const retried = await executor.recoverNode(definition, "r1", "a", { type: "retry" });
@@ -336,6 +337,164 @@ describe("recoverNode", () => {
       "r1",
     );
     expect(done.nodes.c?.output).toEqual({ a: 1, b: 2 });
+  });
+});
+
+describe("recoverNode lease cleanup", () => {
+  for (const operation of ["isCancelRequested", "compareAndSwap"] as const) {
+    it(`releases the lease when ${operation} fails, so the next call need not wait for expiry`, async () => {
+      const { executor, store, definition, shared } = await parked();
+      store.failures.set(operation, new Error("store down"));
+      await expect(executor.recoverNode(definition, "r1", "a", { type: "retry" })).rejects.toThrow(
+        "store down",
+      );
+      expect(store.failures.size).toBe(0);
+      expect((await shared.load("r1"))?.status).toBe("needs-recovery");
+      // No clock advance: before the fix the lease stayed held for its TTL.
+      const retried = await executor.recoverNode(definition, "r1", "a", { type: "retry" });
+      expect(retried.nodes.a?.status).toBe("pending");
+      await expect(shared.acquireLease("r1", "someone", 30_000)).resolves.toBeDefined();
+    });
+  }
+
+  it("releases the lease when the output's predicate throws", async () => {
+    const w = world();
+    const first = w.spawn();
+    const definition = (a: NodeHandler): WorkflowDefinition => ({
+      graph: {
+        id: "wf",
+        version: "1",
+        entry: ["a"],
+        nodes: [
+          { id: "a", handler: "a" },
+          { id: "b", handler: "b" },
+        ],
+        edges: [{ from: "a", to: "b", when: "go" }],
+      },
+      handlers: { a, b: async () => "b" },
+      predicates: {
+        go: () => {
+          throw new Error("predicate broke");
+        },
+      },
+    });
+    void first.executor.run(
+      definition(async () => {
+        first.store.crash();
+        return "a";
+      }),
+      null,
+      { runId: "r1" },
+    );
+    await settle();
+    await w.clock.advance(30_000);
+    const { executor } = w.spawn();
+    const def = definition(async () => "a");
+    await executor.resume(def, "r1");
+    await expect(
+      executor.recoverNode(def, "r1", "a", { type: "complete", output: "a" }),
+    ).rejects.toThrow(/predicate broke/);
+    await expect(w.shared.acquireLease("r1", "someone", 30_000)).resolves.toBeDefined();
+  });
+
+  it("never lets a release error mask the original one", async () => {
+    const { executor, store, definition } = await parked();
+    store.failures.set("compareAndSwap", new Error("write failed"));
+    store.failures.set("releaseLease", new Error("release failed"));
+    await expect(executor.recoverNode(definition, "r1", "a", { type: "retry" })).rejects.toThrow(
+      "write failed",
+    );
+    expect(store.failures.size).toBe(0); // the release was attempted
+  });
+});
+
+describe("invalid output after a side effect", () => {
+  const ref = {
+    $artifact: { uri: "s3://bucket/r1/a", sha256: "ab".repeat(32), bytes: 300_000 },
+  };
+
+  it("parks the node as uncertain instead of failing the run; completing it with an ArtifactRef continues", async () => {
+    const w = world();
+    const effects = { count: 0 };
+    const { calls, handlers } = counted({
+      a: async () => {
+        effects.count += 1; // e.g. uploaded, charged, sent…
+        return "x".repeat(300_000); // …then returned the whole result inline
+      },
+    });
+    // Automatic retry is allowed for crashes, but never for a rejected output.
+    const definition = chain(handlers, {
+      a: { recovery: "retry", retry: { maxAttempts: 3, initialDelayMs: 0 } },
+    });
+    const { executor } = w.spawn();
+
+    const parked = await executor.run(definition, "input", { runId: "r1" });
+    expect(parked.status).toBe("needs-recovery");
+    expect(parked.error).toBeUndefined();
+    expect(parked.nodes.a).toMatchObject({
+      status: "uncertain",
+      uncertainReason: "invalid-output",
+      attempt: 1,
+      error: { code: "output-too-large", retryable: false },
+    });
+    expect(parked.nodes.a?.output).toBeUndefined();
+    expect(calls.b).toHaveLength(0);
+
+    // resume() does not re-run it either.
+    expect((await executor.resume(definition, "r1")).status).toBe("needs-recovery");
+    expect(effects.count).toBe(1);
+
+    // After checking the effect and storing the result, the operator supplies a reference.
+    const recovered = await executor.recoverNode(definition, "r1", "a", {
+      type: "complete",
+      output: ref,
+    });
+    expect(recovered.status).toBe("running");
+    expect(recovered.nodes.a).toMatchObject({ status: "completed", output: ref });
+    expect(recovered.nodes.a?.error).toBeUndefined();
+    expect(recovered.nodes.a?.uncertainReason).toBeUndefined();
+
+    const done = await executor.resume(definition, "r1");
+    expect(done.status).toBe("completed");
+    expect(effects.count).toBe(1);
+    expect(calls.a).toHaveLength(1);
+    expect(calls.b[0]?.predecessors).toEqual({ a: ref });
+  });
+
+  it("parks non-JSON output the same way; an explicit retry re-runs it", async () => {
+    const w = world();
+    let attempt = 0;
+    const { calls, handlers } = counted({
+      a: async () => (++attempt === 1 ? ({ at: new Date() } as unknown as JsonValue) : "fixed"),
+    });
+    const definition = chain(handlers);
+    const { executor } = w.spawn();
+    const parked = await executor.run(definition, null, { runId: "r1" });
+    expect(parked.nodes.a).toMatchObject({
+      status: "uncertain",
+      uncertainReason: "invalid-output",
+      error: { code: "output-not-json" },
+    });
+    await executor.recoverNode(definition, "r1", "a", { type: "retry" });
+    const done = await executor.resume(definition, "r1");
+    expect(done.status).toBe("completed");
+    expect(done.nodes.a).toMatchObject({ output: "fixed", attempt: 2 });
+    expect(done.nodes.a?.error).toBeUndefined();
+    expect(calls.a.map((context) => context.idempotencyKey)).toEqual(["r1:a", "r1:a"]);
+  });
+
+  it("rejects a recovery output that is still too large", async () => {
+    const w = world();
+    const { handlers } = counted({ a: async () => "x".repeat(300_000) });
+    const definition = chain(handlers);
+    const { executor } = w.spawn();
+    await executor.run(definition, null, { runId: "r1" });
+    await expect(
+      executor.recoverNode(definition, "r1", "a", {
+        type: "complete",
+        output: "y".repeat(300_000),
+      }),
+    ).rejects.toBeInstanceOf(RecoveryNotApplicableError);
   });
 });
 
