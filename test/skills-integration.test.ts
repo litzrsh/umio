@@ -1,6 +1,6 @@
 /**
  * Skills composed into agents, sequential workflows and graph nodes, with a
- * scripted model (docs/design/umio-skills-design.md §4, §5, §8).
+ * scripted model.
  */
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";

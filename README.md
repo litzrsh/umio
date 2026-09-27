@@ -566,7 +566,7 @@ Files are read as `NNNN-*.md`. The status comes from a `## Status` section or a 
 
 ### Skills
 
-A skill is a directory with a `SKILL.md` and optional text files. The design, and what is deferred, is in `docs/design/umio-skills-design.md`.
+A skill is a directory with a `SKILL.md` and optional text files.
 
 ```text
 skills/
@@ -642,7 +642,7 @@ prepared?.usage();   // [{ name: "code-review", documentDigest, resources: [{ pa
 
 ### Graph workflows
 
-`WorkflowExecutor` runs a directed acyclic graph of nodes: branches, parallel paths and joins, with retries, timeouts and cancellation. Every change to a run is checkpointed to a `CheckpointStore`, and an interrupted run can be resumed by another process. The design and its invariants are in `docs/work/umio-graph-workflow-plan.md`.
+`WorkflowExecutor` runs a directed acyclic graph of nodes: branches, parallel paths and joins, with retries, timeouts and cancellation. Every change to a run is checkpointed to a `CheckpointStore`, and an interrupted run can be resumed by another process.
 
 ```typescript
 import { agentNode, WorkflowExecutor, type WorkflowDefinition } from "@litzrsh/umio";

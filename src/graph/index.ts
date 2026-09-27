@@ -1,4 +1,4 @@
-// Public graph-workflow surface (docs/work/umio-graph-workflow-plan.md).
+// Public graph-workflow surface.
 export {
   type AgentNodeOptions,
   type AgentNodeOutput,

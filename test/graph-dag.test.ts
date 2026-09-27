@@ -1,4 +1,4 @@
-// P2 (docs/work/umio-graph-workflow-plan.md §9): DAG execution — branches,
+// DAG execution — branches,
 // joins, skip propagation, concurrency and its configuration, output limits,
 // failure while nodes run concurrently, artifacts, and agentNode.
 import { describe, expect, it, vi } from "vitest";

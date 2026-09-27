@@ -1,4 +1,4 @@
-// P0 characterization tests (docs/work/umio-graph-workflow-plan.md §9).
+// Workflow characterization tests.
 // They pin the behavior of the sequential `Workflow` as of commit a216ef9 so the
 // graph-executor refactor cannot change it silently. Do not edit expectations to
 // make a refactor pass; a failing test here is a compatibility break.

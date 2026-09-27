@@ -1,5 +1,5 @@
 /**
- * Skill contracts (docs/design/umio-skills-design.md). A skill is a local
+ * Skill contracts. A skill is a local
  * directory with a `SKILL.md` (YAML frontmatter with `name` and
  * `description`, then Markdown instructions) and optional text resources.
  * Applying a skill gives an agent guidance; it never grants tools or permissions.

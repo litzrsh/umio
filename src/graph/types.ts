@@ -1,5 +1,5 @@
 /**
- * Graph workflow contracts (docs/work/umio-graph-workflow-plan.md §3).
+ * Graph workflow contracts.
  * Definitions and run records are JSON-serializable; handlers, predicates and
  * everything they capture are process-bound and supplied again on every run.
  */

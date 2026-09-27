@@ -1,6 +1,5 @@
 /**
- * Skill catalogs, parsing, selection and bounded resource reads
- * (docs/design/umio-skills-design.md §3–§6, §9).
+ * Skill catalogs, parsing, selection and bounded resource reads.
  */
 import { link, mkdir, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";

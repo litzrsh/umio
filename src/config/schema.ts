@@ -188,7 +188,7 @@ const skillName = z
   .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, "must be a skill name like code-review");
 
 /**
- * Local skills (docs/design/umio-skills-design.md): instruction packages the
+ * Local skills: instruction packages the
  * CLI and `skillsFromConfig` apply to agents. Nothing is permitted unless it
  * is listed in `include`.
  */
